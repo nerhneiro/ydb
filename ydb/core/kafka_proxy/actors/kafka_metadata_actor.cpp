@@ -282,7 +282,7 @@ void TKafkaMetadataActor::Handle(const TEvKafka::TEvResponse::TPtr& ev, const TA
     if (errorCode == EKafkaErrors::NONE_ERROR) {
         TActorId child = SendTopicRequest(topicName);
         TopicIndexes[child].push_back(topicIndex);
-    } else if (errorCode == NKafka::UNKNOWN_SERVER_ERROR && !TopicRequestRetries.contains(topicName)) {
+    } else if (errorCode == NKafka::TOPIC_IS_BEING_CREATED && !TopicRequestRetries.contains(topicName)) {
         Sleep(TDuration::MilliSeconds(200));
         TopicRequestRetries.insert(topicName);
         TActorId child = SendTopicRequest(topicName);

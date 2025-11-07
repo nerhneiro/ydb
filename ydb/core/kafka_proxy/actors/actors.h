@@ -94,7 +94,7 @@ public:
 
     T& operator*() const {
         return *Ptr;
-    } 
+    }
 
     operator bool() const {
         return nullptr != Ptr;
@@ -116,6 +116,8 @@ inline EKafkaErrors ConvertErrorCode(Ydb::StatusIds::StatusCode status) {
             return EKafkaErrors::UNKNOWN_TOPIC_OR_PARTITION;
         case Ydb::StatusIds::UNAUTHORIZED:
             return EKafkaErrors::TOPIC_AUTHORIZATION_FAILED;
+        case Ydb::StatusIds::OVERLOADED:
+            return EKafkaErrors::TOPIC_IS_BEING_CREATED;
         default:
             return EKafkaErrors::UNKNOWN_SERVER_ERROR;
     }
