@@ -530,7 +530,7 @@ public:
 
         static constexpr TKafkaVersions PresentVersions = VersionsAlways;
         static constexpr TKafkaVersions TaggedVersions = VersionsNever;
-        static constexpr TKafkaVersions NullableVersions = VersionsNever;
+        static constexpr TKafkaVersions NullableVersions = VersionsAlways;
         static constexpr TKafkaVersions FlexibleVersions = VersionsNever;
     };
     ValueMeta::Type Value;
@@ -576,7 +576,7 @@ public:
 
         static constexpr TKafkaVersions PresentVersions = VersionsAlways;
         static constexpr TKafkaVersions TaggedVersions = VersionsNever;
-        static constexpr TKafkaVersions NullableVersions = VersionsNever;
+        static constexpr TKafkaVersions NullableVersions = VersionsAlways;
         static constexpr TKafkaVersions FlexibleVersions = VersionsNever;
     };
     RecordMeta::Type Record;
