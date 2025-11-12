@@ -118,6 +118,8 @@ inline EKafkaErrors ConvertErrorCode(Ydb::StatusIds::StatusCode status) {
             return EKafkaErrors::TOPIC_AUTHORIZATION_FAILED;
         case Ydb::StatusIds::OVERLOADED:
             return EKafkaErrors::TOPIC_IS_BEING_CREATED;
+        case Ydb::StatusIds::ALREADY_EXISTS:
+            return EKafkaErrors::TOPIC_IS_BEING_CREATED;
         default:
             return EKafkaErrors::UNKNOWN_SERVER_ERROR;
     }

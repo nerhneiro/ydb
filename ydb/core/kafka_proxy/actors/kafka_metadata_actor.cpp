@@ -252,17 +252,25 @@ void TKafkaMetadataActor::HandleLocationResponse(TEvLocationResponse::TPtr ev, c
         if (status == Ydb::StatusIds::SUCCESS) {
             KAFKA_LOG_D("Describe topic '" << topic.Name << "' location finishied successful");
             PendingTopicResponses.emplace(index, locationResponse);
-        } else if (!Message->AllowAutoTopicCreation || !Context->Config.GetAutoCreateTopicsEnable() || TopicСreationAttempts.find(*topic.Name) != TopicСreationAttempts.end()) {
+        } else if (!Message->AllowAutoTopicCreation || !Context->Config.GetAutoCreateTopicsEnable()) {
             KAFKA_LOG_ERROR("Describe topic '" << topic.Name << "' location finishied with error: Code="
-                << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
+                    << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
             AddTopicError(topic, ConvertErrorCode(locationResponse->Status));
-        } else if (status == Ydb::StatusIds::SCHEME_ERROR && TopicСreationAttempts.find(*topic.Name) == TopicСreationAttempts.end()) {
-            if (!TopicСreationAttempts.contains(*topic.Name)) {
-                KAFKA_LOG_D("Sending create topic'" << topic.Name << "' request");
-                TopicСreationAttempts.insert(*topic.Name);
-                PendingResponses++;
-                SendCreateTopicsRequest(*topic.Name, index, ctx);
+        } else if (auto topicIter = TopicСreationAttempts.find(*topic.Name); topicIter != TopicСreationAttempts.end()) {
+            if (topicIter->second == 1) {
+                Sleep(TDuration::MilliSeconds(300));
+                TActorId child = SendTopicRequest(*topic.Name);
+                TopicIndexes[child].push_back(index);
+            } else {
+                KAFKA_LOG_ERROR("Describe topic '" << topic.Name << "' location finishied with error: Code="
+                    << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
+                AddTopicError(topic, ConvertErrorCode(locationResponse->Status));
             }
+        } else if (status == Ydb::StatusIds::SCHEME_ERROR) {
+            KAFKA_LOG_D("Sending create topic '" << topic.Name << "' request");
+            TopicСreationAttempts[*topic.Name] = 0;
+            PendingResponses++;
+            SendCreateTopicsRequest(*topic.Name, index, ctx);
         }
     }
     if (InflyCreateTopics == 0) {
@@ -279,15 +287,23 @@ void TKafkaMetadataActor::Handle(const TEvKafka::TEvResponse::TPtr& ev, const TA
     InflyCreateTopics--;
     PendingResponses--;
     EKafkaErrors errorCode = ev->Get()->ErrorCode;
-    if (errorCode == EKafkaErrors::NONE_ERROR) {
+    KAFKA_LOG_D("Recieved responce from CreateTopicActor. errorCode = " << errorCode << ", ErrorCode = " << ErrorCode);
+    if (errorCode == EKafkaErrors::NONE_ERROR || errorCode == NKafka::TOPIC_IS_BEING_CREATED) {
+        TopicСreationAttempts[topicName] = 1;
+        Sleep(TDuration::MilliSeconds(500));
         TActorId child = SendTopicRequest(topicName);
         TopicIndexes[child].push_back(topicIndex);
-    } else if (errorCode == NKafka::TOPIC_IS_BEING_CREATED && !TopicRequestRetries.contains(topicName)) {
-        Sleep(TDuration::MilliSeconds(200));
-        TopicRequestRetries.insert(topicName);
-        TActorId child = SendTopicRequest(topicName);
-        TopicIndexes[child].push_back(topicIndex);
-    } else {
+        // TopicRequestRetries.insert(topicName);
+    }
+    // else if ( && !TopicRequestRetries.contains(topicName)) {
+    //     TopicСreationAttempts[topicName] = 1;
+    //     KAFKA_LOG_D("Topic " << topicName << " is being created. Waiting for 300ms.");
+    //     Sleep(TDuration::MilliSeconds(300));
+    //     TopicRequestRetries.insert(topicName);
+    //     TActorId child = SendTopicRequest(topicName);
+    //     TopicIndexes[child].push_back(topicIndex);
+    // }
+    else {
         Response->Topics[topicIndex].ErrorCode = errorCode;
         if (InflyCreateTopics == 0) {
             RespondIfRequired(ctx);

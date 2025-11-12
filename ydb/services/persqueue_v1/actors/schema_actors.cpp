@@ -1382,7 +1382,9 @@ bool TPartitionsLocationActor::ApplyResponse(
         partLocation.PartitionId = part.GetPartitionId();
         partLocation.Generation = part.GetGeneration();
         partLocation.NodeId = nodeId;
-        Response->Partitions.emplace_back(std::move(partLocation));
+        if (TopicPartitionsIds.contains(partLocation.PartitionId)) {
+            Response->Partitions.emplace_back(std::move(partLocation));
+        }
     }
     Finalize();
     return true;
@@ -1393,6 +1395,7 @@ void TPartitionsLocationActor::Finalize() {
         Y_ABORT_UNLESS(Response->Partitions.size() == Settings.Partitions.size());
     } else {
         Y_ABORT_UNLESS(Response->Partitions.size() == PQGroupInfo->Description.PartitionsSize());
+        // ToDo: there will be verify if partitions
     }
     TBase::RespondWithCode(Ydb::StatusIds::SUCCESS);
 }

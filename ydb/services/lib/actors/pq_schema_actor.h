@@ -571,6 +571,9 @@ namespace NKikimr::NGRpcProxy::V1 {
 
             auto& item = ev->Get()->Request->ResultSet[0];
             PQGroupInfo = item.PQGroupInfo;
+            for (const auto& partition : PQGroupInfo->Description.GetPartitions()) {
+                TopicPartitionsIds.insert(partition.GetPartitionId());
+            }
             Self = item.Self;
 
             return true;
@@ -633,6 +636,7 @@ namespace NKikimr::NGRpcProxy::V1 {
     protected:
         THolder<TEvResponse> Response;
         TIntrusiveConstPtr<NSchemeCache::TSchemeCacheNavigate::TPQGroupInfo> PQGroupInfo;
+        TSet<i64> TopicPartitionsIds;
         TIntrusiveConstPtr<NSchemeCache::TSchemeCacheNavigate::TDirEntryInfo> Self;
         TMaybe<TString> PrivateTopicName;
         TMaybe<TString> CdcStreamName;

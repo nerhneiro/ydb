@@ -94,7 +94,7 @@ private:
     bool NeedAllNodes = false;
     bool HaveError = false;
     TMap<ui64, TSimpleSharedPtr<TEvLocationResponse>> PendingTopicResponses;
-    TSet<TString> TopicСreationAttempts;
+    TMap<TString, bool> TopicСreationAttempts; // if creation attempt was successful
     TMap<TActorId, TTopicNameToIndex> CreateTopicRequests;
 
     void Handle(const TEvKafka::TEvResponse::TPtr& ev, const TActorContext& ctx);
