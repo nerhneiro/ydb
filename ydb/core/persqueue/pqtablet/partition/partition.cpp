@@ -451,6 +451,7 @@ bool TPartition::ImportantConsumersNeedToKeepCurrentKey(const TDataKey& currentK
             return true;
         }
     }
+
     return false;
 }
 
@@ -821,6 +822,9 @@ TConsumerSnapshot TPartition::CreateSnapshot(TUserInfo& userInfo) const {
     if (userInfo.Offset >= static_cast<i64>(GetEndOffset())) {
         result.LastCommittedMessage.CreateTimestamp = now;
         result.LastCommittedMessage.WriteTimestamp = now;
+    } else if (userInfo.ActualTimestamps) {
+        result.LastCommittedMessage.CreateTimestamp = userInfo.CreateTimestamp;
+        result.LastCommittedMessage.WriteTimestamp = userInfo.WriteTimestamp;
     } else {
         auto timestamp = GetWriteTimeEstimate(userInfo.Offset);
         result.LastCommittedMessage.CreateTimestamp = timestamp;
@@ -931,7 +935,7 @@ void TPartition::Handle(TEvPQ::TEvPartitionStatus::TPtr& ev, const TActorContext
             NKikimrPQ::TClientInfo* clientInfo = result.MutableLagsInfo();
             clientInfo->SetClientId(userInfo.User);
 
-            auto snapshot = CreateSnapshot(userInfo);
+            const auto snapshot = CreateSnapshot(userInfo);
 
             auto write = clientInfo->MutableWritePosition();
             write->SetOffset(userInfo.Offset);
@@ -961,7 +965,7 @@ void TPartition::Handle(TEvPQ::TEvPartitionStatus::TPtr& ev, const TActorContext
         }
 
         if (ev->Get()->GetStatForAllConsumers) { //fill lags
-            auto snapshot = CreateSnapshot(userInfo);
+            const auto snapshot = CreateSnapshot(userInfo);
 
             auto* clientInfo = result.AddConsumerResult();
             clientInfo->SetConsumer(userInfo.User);
@@ -1102,7 +1106,7 @@ void TPartition::Handle(TEvPQ::TEvGetPartitionClientInfo::TPtr& ev, const TActor
     result.SetEndOffset(GetEndOffset());
     result.SetResponseTimestamp(ctx.Now().MilliSeconds());
     for (auto&& pr : UsersInfoStorage->GetAll()) {
-        auto snapshot = CreateSnapshot(pr.second);
+        const auto snapshot = CreateSnapshot(pr.second);
 
         const TUserInfo& userInfo(pr.second);
         NKikimrPQ::TClientInfo& clientInfo = *result.AddClientInfo();
@@ -1888,7 +1892,7 @@ bool TPartition::UpdateCounters(const TActorContext& ctx, bool force) {
         if (userInfoPair.first != CLIENTID_WITHOUT_CONSUMER && !userInfo.HasReadRule && !userInfo.Important)
             continue;
         bool haveChanges = false;
-        auto snapshot = CreateSnapshot(userInfo);
+        const auto snapshot = CreateSnapshot(userInfo);
 
         auto ts = snapshot.LastCommittedMessage.WriteTimestamp.MilliSeconds();
         if (ts < MIN_TIMESTAMP_MS) {
@@ -3165,7 +3169,7 @@ void TPartition::BeginChangePartitionConfig(const NKikimrPQ::TPQTabletConfig& co
             ts += TDuration::MilliSeconds(1);
         }
         userInfo.ReadFromTimestamp = ts;
-        userInfo.Important = consumer.GetImportant();
+        userInfo.Important = IsImportant(consumer);
         userInfo.AvailabilityPeriod = TDuration::MilliSeconds(consumer.GetAvailabilityPeriodMs());
 
         ui64 rrGen = consumer.GetGeneration();
@@ -4541,6 +4545,10 @@ void TPartition::ResetDetailedMetrics() {
     TimeSinceLastWriteMsPerPartition.Reset();
     BytesWrittenPerPartition.Reset();
     MessagesWrittenPerPartition.Reset();
+}
+
+bool IsImportant(const NKikimrPQ::TPQTabletConfig::TConsumer& consumer) {
+    return consumer.GetImportant() || consumer.GetType() == NKikimrPQ::TPQTabletConfig::CONSUMER_TYPE_MLP;
 }
 
 } // namespace NKikimr::NPQ
