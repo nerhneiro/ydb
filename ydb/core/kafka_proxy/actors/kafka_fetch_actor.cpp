@@ -30,7 +30,7 @@ void TKafkaFetchActor::Bootstrap(const NActors::TActorContext& ctx) {
 
 void TKafkaFetchActor::SendFetchRequests(const TActorContext& ctx) {
     Response->Responses.resize(FetchRequestData->Topics.size());
-    KAFKA_LOG_D(TStringBuilder() << "Fetch actor: New request. DatabasePath: " << Context->DatabasePath 
+    KAFKA_LOG_D(TStringBuilder() << "Fetch actor: New request. DatabasePath: " << Context->DatabasePath
         << " MaxWaitMs: " << FetchRequestData->MaxWaitMs << " MaxBytes: " << FetchRequestData->MaxBytes);
     for (size_t topicIndex = 0; topicIndex <  Response->Responses.size(); topicIndex++) {
         auto partPQRequests = PrepareFetchRequestData(topicIndex);
@@ -208,7 +208,9 @@ void TKafkaFetchActor::FillRecordsBatch(const NKikimrClient::TPersQueueFetchResp
         header.Value = header.CodecValueStr;
         record.Headers.push_back(header);
 
-        record.Value = record.DataChunk.GetData();
+        if (record.DataChunk.HasData()) {
+            record.Value = record.DataChunk.GetData();
+        }
         record.OffsetDelta = lastOffset - baseOffset;
         record.TimestampDelta = lastTimestamp - baseTimestamp;
 
