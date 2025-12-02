@@ -32,6 +32,7 @@
 #include <ydb/core/jaeger_tracing/sampling_throttling_configurator.h>
 #include <ydb/library/persqueue/topic_parser/counters.h>
 #include <library/cpp/json/json_writer.h>
+#include <ydb/core/kafka_proxy/kafka_producer_instance_id.h>
 
 #include <util/generic/strbuf.h>
 
@@ -55,6 +56,9 @@ static constexpr ui32 MAX_BYTES = 25_MB;
 static constexpr ui32 MAX_SOURCE_ID_LENGTH = 2048;
 static constexpr ui32 MAX_HEARTBEAT_SIZE = 2_KB;
 static constexpr ui32 MAX_TXS = 1000;
+
+NKafka::TProducerInstanceId DEFAULT_PRODUCER_INSTANCE_ID = {-1, -1};
+TWriteId DEFAULT_WRITE_ID = TWriteId(DEFAULT_PRODUCER_INSTANCE_ID);
 
 struct TChangeNotification {
     TChangeNotification(const TActorId& actor, const ui64 txId)
@@ -711,8 +715,7 @@ void TPersQueue::InitTxWrites(const NKikimrPQ::TTabletTxInfo& info,
     for (size_t i = 0; i != info.TxWritesSize(); ++i) {
         auto& txWrite = info.GetTxWrites(i);
         const TWriteId writeId = GetWriteId(txWrite);
-
-        TTxWriteInfo& writeInfo = TxWrites[writeId];
+        TTxWriteInfo& writeInfo = TxWrites[writeId]; // в каком порядке приходит InitTxWrites?
         if (txWrite.HasOriginalPartitionId()) {
             ui32 partitionId = txWrite.GetOriginalPartitionId();
             TPartitionId shadowPartitionId(partitionId, writeId, txWrite.GetInternalPartitionId());
@@ -833,7 +836,7 @@ void TPersQueue::ReadConfig(const NKikimrClient::TKeyValueResponse::TReadResult&
 
             if (tx.HasWriteId()) {
                 PQ_LOG_TX_I("Link TxId " << tx.GetTxId() << " with WriteId " << GetWriteId(tx));
-                TxWrites[GetWriteId(tx)].TxId = tx.GetTxId();
+                TxWrites[GetWriteId(tx)].TxId = tx.GetTxId(); // ?
             }
         }
     }
@@ -2000,7 +2003,7 @@ void TPersQueue::HandleWriteRequest(const ui64 responseCookie, NWilson::TTraceId
                 createTimestampMs, receiveTimestampMs, disableDeduplication, writeTimestampMs, data,
                 cmd.HasUncompressedSize() ? cmd.GetUncompressedSize() : 0u, cmd.GetPartitionKey(), cmd.GetExplicitHash(),
                 cmd.GetExternalOperation(), cmd.GetIgnoreQuotaDeadline(), heartbeatVersion, cmd.GetEnableKafkaDeduplication(),
-                (cmd.HasProducerEpoch() ? TMaybe<i32>(cmd.GetProducerEpoch()) : Nothing())
+                (cmd.HasProducerEpoch() ? TMaybe<i32>(cmd.GetProducerEpoch()) : Nothing()) // мб тут писать -1? но это поломает обычные транзакции
             });
         }
         PQ_LOG_D("got client message topic: " << (TopicConverter ? TopicConverter->GetClientsideName() : "Undefined") <<
@@ -2008,7 +2011,8 @@ void TPersQueue::HandleWriteRequest(const ui64 responseCookie, NWilson::TTraceId
                  " SourceId: \'" << EscapeC(msgs.back().SourceId) <<
                  "\' SeqNo: " << msgs.back().SeqNo << " partNo : " << msgs.back().PartNo <<
                  " messageNo: " << req.GetMessageNo() << " size " << msgs.back().Data.size() <<
-                 " offset: " << (req.HasCmdWriteOffset() ? (req.GetCmdWriteOffset() + i) : -1));
+                 " offset: " << (req.HasCmdWriteOffset() ? (req.GetCmdWriteOffset() + i) : -1) <<
+                 " producer_epoch: " << (cmd.HasProducerEpoch() ? std::to_string(cmd.GetProducerEpoch()) : "not defined")); // тут уже пустой
     }
     InitResponseBuilder(responseCookie, msgs.size(), COUNTER_LATENCY_PQ_WRITE);
     std::optional<ui64> initialSeqNo;
@@ -2389,15 +2393,24 @@ const TPartitionInfo& TPersQueue::GetPartitionInfo(const NKikimrClient::TPersQue
     const TWriteId writeId = GetWriteId(req);
     ui32 originalPartitionId = req.GetPartition();
 
-    PQ_ENSURE(TxWrites.contains(writeId) && TxWrites.at(writeId).Partitions.contains(originalPartitionId))
+    bool writeIdCorrect = TxWrites.contains(writeId) && TxWrites.at(writeId).Partitions.contains(originalPartitionId);
+    bool defaultWriteIdCorrect =TxWrites.contains(DEFAULT_WRITE_ID) && TxWrites.at(DEFAULT_WRITE_ID).Partitions.contains(originalPartitionId);
+    PQ_ENSURE(writeIdCorrect || defaultWriteIdCorrect)
         ("WriteId", writeId.ToString())("partition_id", originalPartitionId);
 
-    const TPartitionId& partitionId = TxWrites.at(writeId).Partitions.at(originalPartitionId);
-    PQ_ENSURE(Partitions.contains(partitionId));
-    const TPartitionInfo& partition = Partitions.at(partitionId);
-    PQ_ENSURE(partition.InitDone);
-
-    return partition;
+    if (writeIdCorrect) {
+        const TPartitionId& partitionId = TxWrites.at(writeId).Partitions.at(originalPartitionId);
+        PQ_ENSURE(Partitions.contains(partitionId));
+        const TPartitionInfo& partition = Partitions.at(partitionId);
+        PQ_ENSURE(partition.InitDone);
+        return partition;
+    } else {
+        const TPartitionId& partitionId = TxWrites.at(DEFAULT_WRITE_ID).Partitions.at(originalPartitionId);
+        PQ_ENSURE(Partitions.contains(partitionId));
+        const TPartitionInfo& partition = Partitions.at(partitionId);
+        PQ_ENSURE(partition.InitDone);
+        return partition;
+    }
 }
 
 void TPersQueue::HandleGetOwnershipRequestForSupportivePartition(const ui64 responseCookie,
@@ -2481,10 +2494,10 @@ void TPersQueue::HandleEventForSupportivePartition(const ui64 responseCookie,
     if (writeId.IsKafkaApiTransaction() && TxWrites.contains(writeId) && TxWrites.at(writeId).Deleting) {
         // This branch happens when previous Kafka transaction has committed and we recieve write for next one
         // after PQ has deleted supportive partition and before it has deleted writeId from TxWrites (tx has not transaitioned to DELETED state)
-        PQ_LOG_D("GetOwnership request for the next Kafka transaction while previous is being deleted. Saving it till the complete delete of the previous tx.%01");
+        PQ_LOG_D("GetOwnership request for the next Kafka transaction while previous is being deleted. Saving it till the complete delete of the previous tx.%01 writeId=" << writeId);
         KafkaNextTransactionRequests[writeId.KafkaProducerInstanceId].push_back(event);
         return;
-    } else if (TxWrites.contains(writeId) && TxWrites.at(writeId).Partitions.contains(originalPartitionId)) {
+    } else if (TxWrites.contains(writeId) && TxWrites.at(writeId).Partitions.contains(originalPartitionId)) { // тут?
         //
         // - вспомогательная партиция уже существует
         // - если партиция инициализирована, то
@@ -2502,7 +2515,7 @@ void TPersQueue::HandleEventForSupportivePartition(const ui64 responseCookie,
         } else if (writeInfo.TxId.Defined() && writeId.IsKafkaApiTransaction()) {
             // This branch happens when previous Kafka transaction has committed and we recieve write for next one
             // before PQ has deleted supportive partition for previous transaction
-            PQ_LOG_D("GetOwnership request for the next Kafka transaction while previous is being deleted. Saving it till the complete delete of the previous tx.%02");
+            PQ_LOG_D("GetOwnership request for the next Kafka transaction while previous is being deleted. Saving it till the complete delete of the previous tx.%02, writeId=" << writeId);
             KafkaNextTransactionRequests[writeId.KafkaProducerInstanceId].push_back(event);
             return;
         }
@@ -2566,7 +2579,7 @@ void TPersQueue::HandleEventForSupportivePartition(const ui64 responseCookie,
         if (writeId.IsTopicApiTransaction() && writeInfo.LongTxSubscriptionStatus == NKikimrLongTxService::TEvLockStatus::STATUS_UNSPECIFIED) {
             SubscribeWriteId(writeId, ctx);
         }
-
+        PQ_LOG_TX_I("Is KafkaApiTransaction = " << writeId.KafkaApiTransaction);
         if (writeId.KafkaApiTransaction) {
             writeInfo.KafkaTransaction = true;
             writeInfo.CreatedAt = TAppData::TimeProvider->Now();
@@ -3043,7 +3056,12 @@ void TPersQueue::ScheduleDeleteExpiredKafkaTransactions() {
     }
 }
 
-void TPersQueue::TryContinueKafkaWrites(const TMaybe<TWriteId> writeId, const TActorContext& ctx) {
+void TPersQueue::TryContinueKafkaWrites(const TMaybe<TWriteId> writeId, const TActorContext& ctx) { // ?
+    if (writeId.Defined()) {
+        PQ_LOG_TX_W("TryContinueKafkaWrites with writeId = " << writeId->KafkaProducerInstanceId);
+    } else {
+        PQ_LOG_TX_W("TryContinueKafkaWrites with writeId = not defined");
+    }
     if (writeId.Defined() && writeId->IsKafkaApiTransaction()) {
         auto it = KafkaNextTransactionRequests.find(writeId->KafkaProducerInstanceId);
         if (it != KafkaNextTransactionRequests.end()) {
@@ -3152,10 +3170,14 @@ bool TPersQueue::CheckTxWriteOperation(const NKikimrPQ::TPartitionOperation& ope
     TPartitionId partitionId;
     if (operation.GetKafkaTransaction()) {
         auto txWriteInfoIt = TxWrites.find(writeId);
-        if (txWriteInfoIt == TxWrites.end()) {
+        NKafka::TProducerInstanceId defaultProducerInstanceId = {-1, -1};
+        TWriteId defaultWriteId = TWriteId(defaultProducerInstanceId);
+        auto txWriteDefaultIt = TxWrites.find(defaultWriteId);
+        PQ_LOG_D("writeId = " << writeId);
+        if (txWriteInfoIt == TxWrites.end() && txWriteDefaultIt == TxWrites.end()) {
             return false;
         }
-        auto it = txWriteInfoIt->second.Partitions.find(operation.GetPartitionId());
+        auto it = txWriteDefaultIt == TxWrites.end() ? txWriteInfoIt->second.Partitions.find(operation.GetPartitionId()) : txWriteDefaultIt->second.Partitions.find(operation.GetPartitionId());
         if (it == txWriteInfoIt->second.Partitions.end()) {
             return false;
         } else {
@@ -3238,7 +3260,8 @@ void TPersQueue::HandleDataTransaction(TAutoPtr<TEvPersQueue::TEvProposeTransact
 
     if (txBody.HasWriteId()) {
         const TWriteId writeId = GetWriteId(txBody);
-        if (!TxWrites.contains(writeId)) {
+        auto txWriteDefaultIt = TxWrites.find(DEFAULT_WRITE_ID);
+        if (txWriteDefaultIt == TxWrites.end() && !TxWrites.contains(writeId)) {
             PQ_LOG_TX_W("TxId " << event.GetTxId() << " unknown WriteId " << writeId);
             SendProposeTransactionAbort(ActorIdFromProto(event.GetSourceActor()),
                                         event.GetTxId(),
@@ -3248,9 +3271,9 @@ void TPersQueue::HandleDataTransaction(TAutoPtr<TEvPersQueue::TEvProposeTransact
             return;
         }
 
-        TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+        TTxWriteInfo& writeInfo = txWriteDefaultIt == TxWrites.end() ? TxWrites.at(writeId) : TxWrites.at(DEFAULT_WRITE_ID);
         if (writeInfo.Deleting) {
-            PQ_LOG_TX_W("TxId " << event.GetTxId() << " WriteId " << writeId << " will be deleted");
+            PQ_LOG_TX_W("TxId " << event.GetTxId() << " WriteId " << writeId << " will be deleted"); // сюда не зашли
             SendProposeTransactionAbort(ActorIdFromProto(event.GetSourceActor()),
                                         event.GetTxId(),
                                         NKikimrPQ::TError::BAD_REQUEST,
@@ -3645,8 +3668,10 @@ void TPersQueue::ProcessProposeTransactionQueue(const TActorContext& ctx)
 
             if (tx.WriteId.Defined()) {
                 const TWriteId& writeId = *tx.WriteId;
-                PQ_ENSURE(TxWrites.contains(writeId))("TxId", tx.TxId)("WriteId", writeId.ToString());
-                TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+                bool writeIdInTxWrites = TxWrites.contains(writeId);
+                bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+                PQ_ENSURE(writeIdInTxWrites || defaultWriteIdInTxWrites)("TxId", tx.TxId)("WriteId", writeId.ToString());
+                TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(writeId) : TxWrites.at(DEFAULT_WRITE_ID);
                 PQ_LOG_TX_D("Link TxId " << tx.TxId << " with WriteId " << writeId);
                 writeInfo.TxId = tx.TxId;
             }
@@ -3753,6 +3778,7 @@ void TPersQueue::ProcessPlanStepQueue(const TActorContext& ctx)
 void TPersQueue::ProcessWriteTxs(const TActorContext& ctx,
                                  NKikimrClient::TKeyValueRequest& request)
 {
+    PQ_LOG_D("ProcessWriteTxs");
     PQ_ENSURE(!WriteTxsInProgress);
 
     if (!WriteTxs.empty() && HasTxPersistSpan && !WriteTxsSpan) {
@@ -3973,12 +3999,13 @@ TMaybe<TPartitionId> TPersQueue::FindPartitionId(const NKikimrPQ::TDataTransacti
 
     if (txBody.HasWriteId() && hasWriteOperation(txBody)) {
         const TWriteId writeId = GetWriteId(txBody);
-        if (!TxWrites.contains(writeId)) {
-            PQ_LOG_TX_W("unknown WriteId " << writeId);
+        auto txWriteDefaultIt = TxWrites.find(DEFAULT_WRITE_ID);
+        if (!TxWrites.contains(writeId) && txWriteDefaultIt == TxWrites.end()) {
+            PQ_LOG_TX_W("unknown WriteId " << writeId); // во второй раз заходим сюда. В какой момент добавляем {-1, -1}  в TxWrites? и удаляем?
             return Nothing();
         }
 
-        const TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+        const TTxWriteInfo& writeInfo = txWriteDefaultIt == TxWrites.end() ? TxWrites.at(writeId) : TxWrites.at(DEFAULT_WRITE_ID);
         if (!writeInfo.Partitions.contains(partitionId)) {
             PQ_LOG_TX_W("unknown partition " << partitionId << " for WriteId " << writeId);
             return Nothing();
@@ -4030,8 +4057,10 @@ void TPersQueue::SendEvTxCalcPredicateToPartitions(const TActorContext& ctx,
 
     if (tx.WriteId.Defined()) {
         const TWriteId& writeId = *tx.WriteId;
-        if (TxWrites.contains(writeId)) {
-            const TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+        bool writeIdInTxWrites = TxWrites.contains(writeId);
+        bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+        if (writeIdInTxWrites || defaultWriteIdInTxWrites) {
+            const TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(writeId) :  TxWrites.at(DEFAULT_WRITE_ID);
 
             for (auto& [originalPartitionId, partitionId] : writeInfo.Partitions) {
                 if (!OriginalPartitionExists(originalPartitionId)) {
@@ -4509,7 +4538,8 @@ void TPersQueue::CheckTxState(const TActorContext& ctx,
 
     case NKikimrPQ::TTransaction::DELETING:
         // The PQ tablet has persisted its state. Now she can delete the transaction and take the next one.
-        TMaybe<TWriteId> writeId = tx.WriteId; // copy writeId to save for kafka transaction after erase
+        TMaybe<TWriteId> writeId = tx.WriteId; // copy writeId to save for kafka transaction after erase // тут??
+        // KAFKA_LOG_D("Deleting writeID " << *writeId)
         DeleteWriteId(writeId);
         PQ_LOG_TX_I("delete TxId " << tx.TxId);
         Txs.erase(tx.TxId);
@@ -4526,12 +4556,14 @@ void TPersQueue::CheckTxState(const TActorContext& ctx,
 
 bool TPersQueue::AllSupportivePartitionsHaveBeenDeleted(const TMaybe<TWriteId>& writeId) const
 {
-    if (!writeId.Defined()) {
+    if (!writeId.Defined()) { // мб тут еще удалять {-1, -1}, вот тут не может быть такого, что сапортив партиций 2 для каждого?
         return true;
     }
 
-    PQ_ENSURE(TxWrites.contains(*writeId))("WriteId", writeId->ToString());
-    const TTxWriteInfo& writeInfo = TxWrites.at(*writeId);
+    bool writeIdInTxWrites = TxWrites.contains(*writeId);
+    bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+    PQ_ENSURE(writeIdInTxWrites || defaultWriteIdInTxWrites)("WriteId", writeId->ToString());
+    const TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(*writeId) : TxWrites.at(DEFAULT_WRITE_ID);
 
     PQ_LOG_TX_D("WriteId " << *writeId <<
              " Partitions.size=" << writeInfo.Partitions.size());
@@ -4544,12 +4576,19 @@ bool TPersQueue::AllSupportivePartitionsHaveBeenDeleted(const TMaybe<TWriteId>& 
 
 void TPersQueue::DeleteWriteId(const TMaybe<TWriteId>& writeId)
 {
-    if (!writeId.Defined() || !TxWrites.contains(*writeId)) {
+    bool containsWriteId = writeId.Defined() && TxWrites.contains(*writeId);
+    bool constainsDefaultWriteId = TxWrites.contains(DEFAULT_WRITE_ID);
+    if (!containsWriteId && !constainsDefaultWriteId) {
         return;
     }
-
-    PQ_LOG_TX_I("delete WriteId " << *writeId);
-    TxWrites.erase(*writeId);
+    if (containsWriteId) {
+        PQ_LOG_TX_I("delete WriteId " << *writeId);
+        TxWrites.erase(*writeId);
+    }
+    if (constainsDefaultWriteId) {
+        PQ_LOG_TX_I("delete WriteId " << DEFAULT_WRITE_ID);
+        TxWrites.erase(DEFAULT_WRITE_ID);
+    }
 }
 
 void TPersQueue::WriteTx(TDistributedTransaction& tx, NKikimrPQ::TTransaction::EState state)
@@ -5060,13 +5099,15 @@ void TPersQueue::Handle(NLongTxService::TEvLongTxService::TEvLockStatus::TPtr& e
     auto& record = ev->Get()->Record;
     const TWriteId writeId(record.GetLockNode(), record.GetLockId());
 
-    if (!TxWrites.contains(writeId)) {
+    if (!TxWrites.contains(writeId) && !TxWrites.contains(DEFAULT_WRITE_ID)) { // ??
         // the transaction has already been completed
         PQ_LOG_TX_W("unknown WriteId " << writeId);
         return;
     }
 
-    TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+    bool writeIdInTxWrites = TxWrites.contains(writeId);
+    // bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+    TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(writeId) : TxWrites.at(DEFAULT_WRITE_ID);
     PQ_LOG_TX_D("TxWriteInfo: " <<
              "WriteId " << writeId <<
              ", TxId " << writeInfo.TxId <<
@@ -5140,8 +5181,10 @@ void TPersQueue::Handle(TEvPQ::TEvDeletePartitionDone::TPtr& ev, const TActorCon
     auto* event = ev->Get();
     PQ_ENSURE(event->PartitionId.WriteId.Defined());
     const TWriteId& writeId = *event->PartitionId.WriteId;
-    PQ_ENSURE(TxWrites.contains(writeId))("WriteId", writeId.ToString());
-    TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+    bool writeIdInTxWrites = TxWrites.contains(writeId);
+    bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+    PQ_ENSURE(writeIdInTxWrites || defaultWriteIdInTxWrites)("WriteId", writeId.ToString());
+    TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(writeId) : TxWrites.at(DEFAULT_WRITE_ID);
     PQ_ENSURE(writeInfo.Partitions.contains(event->PartitionId.OriginalPartitionId));
     const TPartitionId& partitionId = writeInfo.Partitions.at(event->PartitionId.OriginalPartitionId);
     PQ_ENSURE(partitionId == event->PartitionId);
@@ -5178,13 +5221,15 @@ void TPersQueue::Handle(TEvPQ::TEvTransactionCompleted::TPtr& ev, const TActorCo
              " WriteId " << ev->Get()->WriteId);
 
     auto* event = ev->Get();
-    if (!event->WriteId.Defined()) {
+    if (!event->WriteId.Defined()) { // ?
         return;
     }
 
     const TWriteId& writeId = *event->WriteId;
-    PQ_ENSURE(TxWrites.contains(writeId))("WriteId", writeId.ToString());
-    TTxWriteInfo& writeInfo = TxWrites.at(writeId);
+    bool writeIdInTxWrites = TxWrites.contains(writeId);
+    bool defaultWriteIdInTxWrites = TxWrites.contains(DEFAULT_WRITE_ID);
+    PQ_ENSURE(writeIdInTxWrites || defaultWriteIdInTxWrites)("WriteId", writeId.ToString());
+    TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(writeId) :  TxWrites.at(DEFAULT_WRITE_ID);
     PQ_ENSURE(writeInfo.Partitions.size() == 1);
 
     BeginDeletePartitions(writeInfo);
@@ -5207,11 +5252,11 @@ void TPersQueue::BeginDeletePartitions(TTxWriteInfo& writeInfo)
 
 void TPersQueue::BeginDeletePartitions(const TDistributedTransaction& tx)
 {
-    if (!tx.WriteId.Defined() || !TxWrites.contains(*tx.WriteId)) {
+    if (!tx.WriteId.Defined() || !TxWrites.contains(*tx.WriteId) && !TxWrites.contains(DEFAULT_WRITE_ID)) {
         return;
     }
-
-    TTxWriteInfo& writeInfo = TxWrites.at(*tx.WriteId);
+    bool writeIdInTxWrites = TxWrites.contains(*tx.WriteId);
+    TTxWriteInfo& writeInfo = writeIdInTxWrites ? TxWrites.at(*tx.WriteId) : TxWrites.at(DEFAULT_WRITE_ID);
     BeginDeletePartitions(writeInfo);
 }
 
