@@ -252,15 +252,25 @@ void TKafkaMetadataActor::HandleLocationResponse(TEvLocationResponse::TPtr ev, c
         if (status == Ydb::StatusIds::SUCCESS) {
             KAFKA_LOG_D("Describe topic '" << topic.Name << "' location finishied successful");
             PendingTopicResponses.emplace(index, locationResponse);
-        } else if (!Message->AllowAutoTopicCreation || !Context->Config.GetAutoCreateTopicsEnable() || TopicСreationAttempts.find(*topic.Name) != TopicСreationAttempts.end()) {
-            KAFKA_LOG_ERROR("Describe topic '" << topic.Name << "' location finishied with error: Code="
-                << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
-            AddTopicError(topic, ConvertErrorCode(locationResponse->Status));
-        } else if (status == Ydb::StatusIds::SCHEME_ERROR && TopicСreationAttempts.find(*topic.Name) == TopicСreationAttempts.end()) {
-            KAFKA_LOG_D("Sending create topic'" << topic.Name << "' request");
-            TopicСreationAttempts.insert(*topic.Name);
-            PendingResponses++;
-            SendCreateTopicsRequest(*topic.Name, index, ctx);
+        } else if (status == Ydb::StatusIds::SCHEME_ERROR
+                && Message->AllowAutoTopicCreation
+                && Context->Config.GetAutoCreateTopicsEnable()) {
+            if (auto topicIter = TopicСreationAttempts.find(*topic.Name); topicIter != TopicСreationAttempts.end()) {
+                if (topicIter->second == 1) {
+                    Sleep(TDuration::MilliSeconds(300));
+                    TActorId child = SendTopicRequest(*topic.Name);
+                    TopicIndexes[child].push_back(index);
+                } else {
+                    KAFKA_LOG_ERROR("Describe topic '" << topic.Name << "' location finishied with error: Code="
+                        << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
+                    AddTopicError(topic, ConvertErrorCode(locationResponse->Status));
+                }
+            } else  {
+                KAFKA_LOG_D("Sending create topic'" << topic.Name << "' request");
+                TopicСreationAttempts.insert(*topic.Name);
+                PendingResponses++;
+                SendCreateTopicsRequest(*topic.Name, index, ctx);
+            }
         } else {
             KAFKA_LOG_ERROR("Describe topic '" << topic.Name << "' location finishied with error: Code="
                 << locationResponse->Status << ", Issues=" << locationResponse->Issues.ToOneLineString());
