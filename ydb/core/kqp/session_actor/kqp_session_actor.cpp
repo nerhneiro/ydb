@@ -567,6 +567,13 @@ public:
                     return false;
                 }
             }
+            for (const auto& offsetInRequest : operations.GetOffsetsInTxn()) {
+                auto path = CanonizePath(NPersQueue::GetFullTopicPath(QueryState->GetDatabase(), offsetInRequest.GetTopicPath()));
+
+                if (!QueryState->TxCtx->TopicOperations.HasThisPartitionAlreadyBeenAdded(path, offsetInRequest.GetPartitionId())) {
+                    return false;
+                }
+            }
         }
 
         return true;

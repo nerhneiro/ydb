@@ -110,7 +110,7 @@ private:
     std::unordered_map<TString, TAutoPtr<TEvKafka::TEvCommitedOffsetsResponse>> TopicsToResponses;
     std::unordered_map<TString, ui32> GroupIdToIndex;
     std::unordered_map<ui32, TString> CookieToGroupId;
-    std::unordered_map<ui32, TString> AlterTopicCookieToName;
+    std::unordered_map<ui32, std::pair<TString, TString>> AlterTopicCookieToTopicAndGroup;
     std::unordered_map<TString, std::vector<TTopicGroupRequest>> GroupRequests;
     std::unordered_map<TActorId, TString> CreateTopicActorIdToName;
     std::unordered_set<NKafka::TTopicGroupIdAndPath, NKafka::TTopicGroupIdAndPathHash> ConsumerTopicAlterRequestAttempts;

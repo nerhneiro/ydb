@@ -338,6 +338,18 @@ void TKafkaOffsetFetchActor::Handle(NKikimr::NReplication::TEvYdbProxy::TEvAlter
     } else {
         KAFKA_LOG_I("Handling TEvAlterTopicResponse. Status: " << result.GetStatus() << "\n");
     }
+    if (result.GetStatus() == NYdb::EStatus::OVERLOADED) {
+        Sleep(TDuration::MilliSeconds(500));
+        const std::pair<TString, TString>& requestInfo = AlterTopicCookieToTopicAndGroup[ev->Cookie];
+        const TString& topicName = requestInfo.first;
+        const TString& groupId = requestInfo.second;
+        TString topicPath = NormalizePath(Context->DatabasePath, topicName);
+        ConsumerTopicAlterRequestAttempts.erase({groupId, topicPath});
+        TKafkaOffsetFetchActor::CreateConsumerGroupIfNecessary(topicName,
+                                                                        topicPath,
+                                                                        topicName,
+                                                                        groupId);
+    }
     if (result.GetStatus() != NYdb::EStatus::SUCCESS) {
         InflyTopics--;
         if (InflyTopics == 0) {
@@ -347,8 +359,8 @@ void TKafkaOffsetFetchActor::Handle(NKikimr::NReplication::TEvYdbProxy::TEvAlter
         }
         return;
     }
-
-    const TString& alteredTopicName = AlterTopicCookieToName[ev->Cookie];
+    Sleep(TDuration::MilliSeconds(300));
+    const TString& alteredTopicName = AlterTopicCookieToTopicAndGroup[ev->Cookie].first;
     NKikimr::NGRpcProxy::V1::TLocalRequestBase locationRequest{
         NormalizePath(Context->DatabasePath, alteredTopicName),
         Context->DatabasePath,
@@ -489,7 +501,7 @@ void TKafkaOffsetFetchActor::CreateConsumerGroupIfNecessary(const TString& topic
     auto* consumer = request->add_add_consumers();
     consumer->set_name(groupId);
     AlterTopicCookie++;
-    AlterTopicCookieToName[AlterTopicCookie] = originalTopicName;
+    AlterTopicCookieToTopicAndGroup[AlterTopicCookie] = {originalTopicName, groupId};
     auto callback = [replyTo = SelfId(), cookie = AlterTopicCookie, path = topicName, this]
         (Ydb::StatusIds::StatusCode statusCode, const google::protobuf::Message*) {
         NYdb::NIssue::TIssues issues;
@@ -582,14 +594,19 @@ TOffsetFetchResponseData::TOffsetFetchResponseGroup::TOffsetFetchResponseTopics 
                 auto groupPartitionToOffset = (*partitionsToOffsets)[requestPartition].find(groupId);
                 if (groupPartitionToOffset != (*partitionsToOffsets)[requestPartition].end()) {
                     partition.CommittedOffset = groupPartitionToOffset->second.Offset;
+                    if (groupPartitionToOffset->second.Offset == 0) {
+                        partition.CommittedOffset = -1001;
+                    }
                     partition.Metadata = groupPartitionToOffset->second.Metadata;
                     partition.ErrorCode = NONE_ERROR;
                 } else {
                     partition.ErrorCode = RESOURCE_NOT_FOUND;
+                    partition.CommittedOffset = -1001;
                     KAFKA_LOG_ERROR("Group " << groupId << " not found for topic " << topicName);
                 }
             } else {
-                partition.ErrorCode = RESOURCE_NOT_FOUND;
+                partition.ErrorCode = UNKNOWN_TOPIC_OR_PARTITION;
+                partition.CommittedOffset = -1001;
                 KAFKA_LOG_ERROR("Partition " << requestPartition << " not found for topic " << topicName);
             }
             topic.Partitions.push_back(partition);
