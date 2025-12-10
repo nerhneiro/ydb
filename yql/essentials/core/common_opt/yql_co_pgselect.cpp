@@ -1,5 +1,7 @@
 #include "yql_co_pgselect.h"
 
+#include "yql_co_yqlselect.h"
+
 #include <yql/essentials/core/type_ann/type_ann_pg.h>
 
 #include <yql/essentials/core/yql_expr_optimize.h>
@@ -54,7 +56,7 @@ TNodeMap<ui32> GatherSubLinks(const TExprNode::TPtr& root) {
     TNodeMap<ui32> subLinks;
 
     VisitExpr(root, [&](const TExprNode::TPtr& node) {
-        if (node->IsCallable("PgSubLink")) {
+        if (node->IsCallable({"PgSubLink", "YqlSubLink"})) {
             subLinks[node.Get()] = subLinks.size();
             return false;
         }
@@ -2089,7 +2091,7 @@ TExprNode::TPtr BuildProjectionLambda(
 
 void GatherAggregationsFromLambda(const TExprNode::TPtr& lambda, TAggs& aggs, TAggregationMap& aggId, bool testExpr) {
     VisitExpr(lambda->TailPtr(), [&](const TExprNode::TPtr& node) {
-        if (node->IsCallable("PgSubLink")) {
+        if (node->IsCallable({"PgSubLink", "YqlSubLink"})) {
             if (!node->Child(3)->IsCallable("Void")) {
                 YQL_ENSURE(node->Child(3)->IsLambda());
                 GatherAggregationsFromLambda(node->ChildPtr(3), aggs, aggId, true);
@@ -2098,7 +2100,7 @@ void GatherAggregationsFromLambda(const TExprNode::TPtr& lambda, TAggs& aggs, TA
             return false;
         }
 
-        if (node->IsCallable("PgAgg")) {
+        if (node->IsCallable({"PgAgg", "YqlAgg"})) {
             aggId[node.Get()] = { aggs.size(), testExpr };
             aggs.push_back({ node, lambda->Head().HeadPtr() });
         }
@@ -2110,7 +2112,8 @@ void GatherAggregationsFromLambda(const TExprNode::TPtr& lambda, TAggs& aggs, TA
 TExprNode::TPtr BuildAggregationTraits(TPositionHandle pos, bool onWindow, const TString& distinctColumnName,
     const std::pair<TExprNode::TPtr, TExprNode::TPtr>& agg,
     const TExprNode::TPtr& listTypeNode, const TAggregationMap* aggId, TExprContext& ctx, TOptimizeContext& optCtx) {
-    auto func = agg.first->Head().Content();
+    const bool isYqlAgg = agg.first->IsCallable("YqlAgg");
+
     TExprNode::TPtr type = ctx.Builder(pos)
         .Callable("ListItemType")
             .Add(0, listTypeNode)
@@ -2136,7 +2139,7 @@ TExprNode::TPtr BuildAggregationTraits(TPositionHandle pos, bool onWindow, const
         auto arg = ctx.NewArgument(pos, "row");
         auto arguments = ctx.NewArguments(pos, { arg });
         TExprNode::TListType aggFuncArgs;
-        for (ui32 j = onWindow ? 3 : 2; j < agg.first->ChildrenSize(); ++j) {
+        for (ui32 j = (onWindow || isYqlAgg) ? 3 : 2; j < agg.first->ChildrenSize(); ++j) {
             auto root = agg.first->ChildPtr(j);
             if (aggId && onWindow) {
                 RewriteAggsPartial(root, arg, *aggId, ctx, optCtx, false);
@@ -2148,6 +2151,16 @@ TExprNode::TPtr BuildAggregationTraits(TPositionHandle pos, bool onWindow, const
         extractor = ctx.NewLambda(pos, std::move(arguments), std::move(aggFuncArgs));
     }
 
+    if (isYqlAgg) {
+        return BuildYqlAggregationTraits(
+            agg.first,
+            std::move(type),
+            std::move(extractor),
+            ctx,
+            optCtx);
+    }
+
+    auto func = agg.first->Head().Content();
     const bool blockEngineEnabled = optCtx.Types->BlockEngineMode != EBlockEngineMode::Disable;
     if (optCtx.Types->PgEmitAggApply.GetOrElse(blockEngineEnabled) && !onWindow) {
         return ctx.Builder(pos)
@@ -3783,7 +3796,7 @@ TExprNode::TPtr ExpandPgSelectImpl(const TExprNode::TPtr& node, TExprContext& ct
 
             if (!unknownsAllowed) {
                 auto pos = node->Pos();
-                list = ctx.NewCallable(pos, "PgReplaceUnknown", { std::move(list), });
+                list = ctx.NewCallable(pos, isYql ? "YqlReplaceUnknown" : "PgReplaceUnknown", { std::move(list), });
             }
         } else {
             YQL_ENSURE(result);
@@ -3922,7 +3935,7 @@ TExprNode::TPtr ExpandPgSelectImpl(const TExprNode::TPtr& node, TExprContext& ct
 
             if (!unknownsAllowed) {
                 auto pos = node->Pos();
-                list = ctx.NewCallable(pos, "PgReplaceUnknown", { std::move(list), });
+                list = ctx.NewCallable(pos, isYql ? "YqlReplaceUnknown" : "PgReplaceUnknown", { std::move(list), });
             }
 
             if (distinctAll) {

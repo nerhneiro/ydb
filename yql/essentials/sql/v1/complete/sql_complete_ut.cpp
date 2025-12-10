@@ -216,6 +216,7 @@ Y_UNIT_TEST(Beginning) {
         {Keyword, "ROLLBACK"},
         {Keyword, "SELECT"},
         {Keyword, "SHOW CREATE"},
+        {Keyword, "TRUNCATE TABLE"},
         {Keyword, "UPDATE"},
         {Keyword, "UPSERT"},
         {Keyword, "USE"},
@@ -438,6 +439,7 @@ Y_UNIT_TEST(Explain) {
         {Keyword, "ROLLBACK"},
         {Keyword, "SELECT"},
         {Keyword, "SHOW CREATE"},
+        {Keyword, "TRUNCATE TABLE"},
         {Keyword, "UPDATE"},
         {Keyword, "UPSERT"},
         {Keyword, "USE"},
@@ -1005,7 +1007,7 @@ Y_UNIT_TEST(SelectTableHintName) {
         TVector<TCandidate> expected = {
             {Keyword, "COLUMNS"},
             {Keyword, "SCHEMA"},
-            {Keyword, "WATERMARK AS()", 1},
+            {Keyword, "WATERMARK"},
             {HintName, "XLOCK"},
         };
         UNIT_ASSERT_VALUES_EQUAL(Complete(engine, "REDUCE my_table WITH "), expected);
@@ -1014,7 +1016,7 @@ Y_UNIT_TEST(SelectTableHintName) {
         TVector<TCandidate> expected = {
             {Keyword, "COLUMNS"},
             {Keyword, "SCHEMA"},
-            {Keyword, "WATERMARK AS()", 1},
+            {Keyword, "WATERMARK"},
             {HintName, "XLOCK"},
         };
         UNIT_ASSERT_VALUES_EQUAL(Complete(engine, "SELECT key FROM my_table WITH "), expected);
@@ -1026,7 +1028,7 @@ Y_UNIT_TEST(InsertTableHintName) {
         {Keyword, "COLUMNS"},
         {HintName, "EXPIRATION"},
         {Keyword, "SCHEMA"},
-        {Keyword, "WATERMARK AS()", 1},
+        {Keyword, "WATERMARK"},
     };
 
     auto engine = MakeSqlCompletionEngineUT();

@@ -10,27 +10,28 @@ logger = logging.getLogger(__name__)
 
 
 class YdbClient:
-    def __init__(self, endpoint, database, use_query_service=False):
+    def __init__(self, endpoint, database, use_query_service=False, sessions=100):
         self.driver = ydb.Driver(endpoint=endpoint, database=database, oauth=None)
         self.database = database
         self.use_query_service = use_query_service
-        self.session_pool = ydb.QuerySessionPool(self.driver) if use_query_service else ydb.SessionPool(self.driver)
+        self.session_pool = ydb.QuerySessionPool(self.driver, size=sessions) if use_query_service else ydb.SessionPool(self.driver, size=sessions)
 
     def wait_connection(self, timeout=5):
         self.driver.wait(timeout, fail_fast=True)
 
-    def query(self, statement, is_ddl, retry_settings=None):
+    def query(self, statement, is_ddl, parameters=None, retry_settings=None, log_error=True):
         if self.use_query_service:
             try:
-                return self.session_pool.execute_with_retries(query=statement, retry_settings=retry_settings)
+                return self.session_pool.execute_with_retries(query=statement, parameters=parameters, retry_settings=retry_settings)
             except Exception as e:
-                logger.error(f"Error: {e} while executing query: {statement}")
+                if log_error:
+                    logger.error(f"Error: {e} while executing query: {statement}")
                 raise e
         else:
             if is_ddl:
                 return self.session_pool.retry_operation_sync(lambda session: session.execute_scheme(statement))
             else:
-                raise "Unsuppported dml"  # TODO implement me
+                return self.session_pool.retry_operation_sync(lambda session: session.transaction().execute(statement, parameters=parameters, commit_tx=True))
 
     def drop_table(self, path_to_table):
         if self.use_query_service:

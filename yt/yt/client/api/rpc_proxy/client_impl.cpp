@@ -25,6 +25,7 @@
 #include <yt/yt/client/signature/signature.h>
 
 #include <yt/yt/client/table_client/columnar_statistics.h>
+#include <yt/yt/client/table_client/constrained_schema.h>
 #include <yt/yt/client/table_client/schema.h>
 #include <yt/yt/client/table_client/unversioned_row.h>
 #include <yt/yt/client/table_client/wire_protocol.h>
@@ -524,6 +525,12 @@ TFuture<void> TClient::AlterTable(
     if (options.SchemaId) {
         ToProto(req->mutable_schema_id(), *options.SchemaId);
     }
+    if (options.ConstrainedSchema) {
+        req->set_constrained_schema(ToProto(ConvertToYsonString(*options.ConstrainedSchema)));
+    }
+    if (options.Constraints) {
+        ToProto(req->mutable_constraints(), *options.Constraints);
+    }
     YT_OPTIONAL_SET_PROTO(req, dynamic, options.Dynamic);
     if (options.UpstreamReplicaId) {
         ToProto(req->mutable_upstream_replica_id(), *options.UpstreamReplicaId);
@@ -858,7 +865,7 @@ TFuture<ITableFragmentWriterPtr> TClient::CreateTableFragmentWriter(
         BIND([=] (TRspPtr&& rsp)  {
             promise.Set(ConvertTo<TSignedWriteFragmentResultPtr>(TYsonString(rsp->signed_write_result())));
         }))
-        .ApplyUnique(BIND([=, future = promise.ToFuture()] (IAsyncZeroCopyOutputStreamPtr&& outputStream) {
+        .AsUnique().Apply(BIND([=, future = promise.ToFuture()] (IAsyncZeroCopyOutputStreamPtr&& outputStream) {
             return NRpcProxy::CreateTableFragmentWriter(std::move(outputStream), std::move(schema), std::move(future));
         }));
 }
@@ -1516,6 +1523,51 @@ TFuture<TSharedRef> TClient::GetJobFailContext(
     }));
 }
 
+TFuture<std::vector<TJobTraceMeta>> TClient::ListJobTraces(
+    const NScheduler::TOperationIdOrAlias& operationIdOrAlias,
+    const NJobTrackerClient::TJobId jobId,
+    const TListJobTracesOptions& options)
+{
+    auto proxy = CreateApiServiceProxy();
+
+    auto req = proxy.ListJobTraces();
+    SetTimeoutOptions(*req, options);
+
+    NScheduler::ToProto(req, operationIdOrAlias);
+    ToProto(req->mutable_job_id(), jobId);
+
+    if (options.PerProcess) {
+        req->set_per_process(*options.PerProcess);
+    }
+    req->set_limit(options.Limit);
+
+    return req->Invoke().Apply(BIND([] (const TApiServiceProxy::TRspListJobTracesPtr& rsp) {
+        return FromProto<std::vector<TJobTraceMeta>>(rsp->traces());
+    }));
+}
+
+TFuture<TCheckOperationPermissionResult> TClient::CheckOperationPermission(
+    const std::string& user,
+    const NScheduler::TOperationIdOrAlias& operationIdOrAlias,
+    NYTree::EPermission permission,
+    const TCheckOperationPermissionOptions& options)
+{
+    auto proxy = CreateApiServiceProxy();
+
+    auto req = proxy.CheckOperationPermission();
+    SetTimeoutOptions(*req, options);
+
+    req->set_user(user);
+    NScheduler::ToProto(req, operationIdOrAlias);
+    req->set_permission(ToProto(permission));
+
+    return req->Invoke().Apply(BIND([] (const TApiServiceProxy::TRspCheckOperationPermissionPtr& rsp) {
+        TCheckOperationPermissionResult result;
+        FromProto(&result, rsp->result());
+        return result;
+    }));
+}
+
 TFuture<TListOperationsResult> TClient::ListOperations(
     const TListOperationsOptions& options)
 {
@@ -1924,7 +1976,7 @@ TFuture<ITablePartitionReaderPtr> TClient::CreateTablePartitionReader(
     NProto::ToProto(req->mutable_cookie(), cookie);
 
     return NRpc::CreateRpcClientInputStream(std::move(req))
-        .ApplyUnique(BIND([] (IAsyncZeroCopyInputStreamPtr&& inputStream) -> TFuture<ITablePartitionReaderPtr>{
+        .AsUnique().Apply(BIND([] (IAsyncZeroCopyInputStreamPtr&& inputStream) -> TFuture<ITablePartitionReaderPtr>{
             return inputStream->Read().Apply(BIND([=] (const TSharedRef& metaRef) {
                 // Actually we don't have any metadata in first version but we can have it in future. Just parse empty proto.
                 NApi::NRpcProxy::NProto::TRspReadTablePartitionMeta meta;
@@ -2986,7 +3038,7 @@ TFuture<IRowBatchReaderPtr> TClient::CreateShuffleReader(
     }
 
     return CreateRpcClientInputStream(std::move(req))
-        .ApplyUnique(BIND([] (IAsyncZeroCopyInputStreamPtr&& inputStream) {
+        .AsUnique().Apply(BIND([] (IAsyncZeroCopyInputStreamPtr&& inputStream) {
             return CreateRowBatchReader(std::move(inputStream), false);
         }));
 }
@@ -3012,7 +3064,7 @@ TFuture<IRowBatchWriterPtr> TClient::CreateShuffleWriter(
     req->set_overwrite_existing_writer_data(options.OverwriteExistingWriterData);
 
     return CreateRpcClientOutputStream(std::move(req))
-        .ApplyUnique(BIND([] (IAsyncZeroCopyOutputStreamPtr&& outputStream) {
+        .AsUnique().Apply(BIND([] (IAsyncZeroCopyOutputStreamPtr&& outputStream) {
             return CreateRowBatchWriter(std::move(outputStream));
         }));
 }

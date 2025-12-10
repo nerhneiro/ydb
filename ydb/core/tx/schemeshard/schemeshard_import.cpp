@@ -36,6 +36,108 @@ namespace {
 
         return state;
     }
+    
+    ui32 GetTablePartsFromRequest(const Ydb::Table::CreateTableRequest& table) {
+        switch (table.partitions_case()) {
+            case Ydb::Table::CreateTableRequest::PartitionsCase::kUniformPartitions:
+                return table.uniform_partitions();
+            case Ydb::Table::CreateTableRequest::PartitionsCase::kPartitionAtKeys:
+                return table.partition_at_keys().split_points_size() + 1;
+            default:
+                // Set min number of partitions as default
+                return table.partitioning_settings().min_partitions_count();
+        }
+    }
+
+    void AddTransferringItemProgress(TSchemeShard* ss, const TImportInfo& importInfo, ui32 itemIdx,
+        Ydb::Import::ImportItemProgress& itemProgress) {
+
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        const auto& item = importInfo.Items.at(itemIdx);
+
+        const auto opId = TOperationId(item.WaitTxId, FirstSubTxId);
+        if (item.WaitTxId != InvalidTxId && ss->TxInFlight.contains(opId) &&
+            ss->TxInFlight.at(opId).TxType == TTxState::TxRestore) {
+            const auto& txState = ss->TxInFlight.at(opId);
+
+            itemProgress.set_parts_total(itemProgress.parts_total() + txState.Shards.size());
+            itemProgress.set_parts_completed(itemProgress.parts_completed() + txState.Shards.size() - txState.ShardsInProgress.size());
+            *itemProgress.mutable_start_time() = SecondsToProtoTimeStamp(txState.StartTime.Seconds());
+        } else {
+            if (!ss->Tables.contains(item.DstPathId)) {
+                return;
+            }
+
+            auto table = ss->Tables.at(item.DstPathId);
+            auto it = table->RestoreHistory.end();
+            if (item.WaitTxId != InvalidTxId && table->RestoreHistory.contains(item.WaitTxId)) {
+                it = table->RestoreHistory.find(item.WaitTxId);
+            } else if (table->RestoreHistory.size() == 1) {
+                it = table->RestoreHistory.begin();
+            }
+
+            if (it == table->RestoreHistory.end()) {
+                return;
+            }
+
+            const auto& restoreResult = it->second;
+            itemProgress.set_parts_total(itemProgress.parts_total() + restoreResult.TotalShardCount);
+            itemProgress.set_parts_completed(itemProgress.parts_completed() + restoreResult.TotalShardCount);
+            *itemProgress.mutable_start_time() = SecondsToProtoTimeStamp(restoreResult.StartDateTime);
+            *itemProgress.mutable_end_time() = SecondsToProtoTimeStamp(restoreResult.CompletionDateTime);
+        }
+    }
+
+    void AddBuildIndexesItemProgress(TSchemeShard* ss, const TImportInfo& importInfo, ui32 itemIdx, 
+        i32 indexIdx, Ydb::Import::ImportItemProgress& itemProgress) {
+
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        const auto& item = importInfo.Items.at(itemIdx);
+
+        if (!item.Table) {
+            return;
+        }
+        Y_ABORT_UNLESS(indexIdx < item.Table->indexes_size());
+
+        const ui32 partsTotal = GetTablePartsFromRequest(*item.Table);
+
+        const auto buildUid = MakeIndexBuildUid(importInfo, itemIdx, indexIdx);
+        if (ss->IndexBuildsByUid.contains(buildUid)) {
+            const auto& indexBuild = ss->IndexBuildsByUid[buildUid];
+
+            ui32 partsCompleted = 0;
+            if (indexBuild->IsTransferring()) {
+                partsCompleted = static_cast<ui32>(indexBuild->CalcProgressPercent() / 100.0f * partsTotal);
+            } else if (indexBuild->IsApplying() || indexBuild->IsFinished()) {
+                partsCompleted = partsTotal;
+            }
+
+            itemProgress.set_parts_total(itemProgress.parts_total() + partsTotal);
+            itemProgress.set_parts_completed(itemProgress.parts_completed() + partsCompleted);
+            if (indexBuild->IsFinished()) {
+                *itemProgress.mutable_end_time() = SecondsToProtoTimeStamp(indexBuild->EndTime.Seconds());
+            }
+        } else if (indexIdx >= item.NextIndexIdx) {
+            itemProgress.set_parts_total(itemProgress.parts_total() + partsTotal);
+            itemProgress.clear_end_time();
+        }
+    }
+
+    void FillItemProgress(TSchemeShard* ss, const TImportInfo& importInfo, ui32 itemIdx,
+        Ydb::Import::ImportItemProgress& itemProgress) {
+
+        AddTransferringItemProgress(ss, importInfo, itemIdx, itemProgress);
+
+        Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+        const auto& item = importInfo.Items.at(itemIdx);
+        if (!item.Table || !itemProgress.has_start_time()) {
+            return;
+        }
+
+        for (i32 indexIdx : xrange(item.Table->indexes_size())) {
+            AddBuildIndexesItemProgress(ss, importInfo, itemIdx, indexIdx, itemProgress);
+        }
+    }
 
 } // anonymous
 
@@ -65,16 +167,27 @@ void TSchemeShard::FromXxportInfo(NKikimrImport::TImport& import, const TImportI
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_PREPARING);
             break;
         case TImportInfo::EState::Transferring:
-            // TODO(ilnaz): fill items progress
+            for (ui32 itemIdx : xrange(importInfo.Items.size())) {
+                FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
+            }
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_TRANSFER_DATA);
             break;
         case TImportInfo::EState::BuildIndexes:
+            for (ui32 itemIdx : xrange(importInfo.Items.size())) {
+                FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
+            }
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_BUILD_INDEXES);
             break;
         case TImportInfo::EState::CreateChangefeed:
+            for (ui32 itemIdx : xrange(importInfo.Items.size())) {
+                FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
+            }
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_CREATE_CHANGEFEEDS);
             break;
         case TImportInfo::EState::Done:
+            for (ui32 itemIdx : xrange(importInfo.Items.size())) {
+                FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
+            }
             import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_DONE);
             break;
         default:
@@ -84,6 +197,9 @@ void TSchemeShard::FromXxportInfo(NKikimrImport::TImport& import, const TImportI
         break;
 
     case TImportInfo::EState::Done:
+        for (ui32 itemIdx : xrange(importInfo.Items.size())) {
+            FillItemProgress(this, importInfo, itemIdx, *import.AddItemsProgress());
+        }
         import.SetProgress(Ydb::Import::ImportProgress::PROGRESS_DONE);
         break;
 
@@ -132,15 +248,21 @@ void TSchemeShard::PersistCreateImport(NIceDb::TNiceDb& db, const TImportInfo& i
     }
 
     for (ui32 itemIdx : xrange(importInfo.Items.size())) {
-        const auto& item = importInfo.Items.at(itemIdx);
-
-        db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
-            NIceDb::TUpdate<Schema::ImportItems::DstPathName>(item.DstPathName),
-            NIceDb::TUpdate<Schema::ImportItems::State>(static_cast<ui8>(item.State)),
-            NIceDb::TUpdate<Schema::ImportItems::SrcPrefix>(item.SrcPrefix),
-            NIceDb::TUpdate<Schema::ImportItems::SrcPath>(item.SrcPath)
-        );
+        PersistNewImportItem(db, importInfo, itemIdx);
     }
+}
+
+void TSchemeShard::PersistNewImportItem(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx) {
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    const auto& item = importInfo.Items.at(itemIdx);
+
+    db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
+        NIceDb::TUpdate<Schema::ImportItems::DstPathName>(item.DstPathName),
+        NIceDb::TUpdate<Schema::ImportItems::State>(static_cast<ui8>(item.State)),
+        NIceDb::TUpdate<Schema::ImportItems::SrcPrefix>(item.SrcPrefix),
+        NIceDb::TUpdate<Schema::ImportItems::SrcPath>(item.SrcPath),
+        NIceDb::TUpdate<Schema::ImportItems::ParentIndex>(item.ParentIdx)
+    );
 }
 
 void TSchemeShard::PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const TImportInfo& importInfo) {
@@ -210,16 +332,19 @@ void TSchemeShard::PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInf
             NIceDb::TUpdate<Schema::ImportItems::Topic>(item.Topic->SerializeAsString())
         );
     }
+
     if (!item.CreationQuery.empty()) {
         record.Update(
             NIceDb::TUpdate<Schema::ImportItems::CreationQuery>(item.CreationQuery)
         );
     }
+
     if (item.Permissions.Defined()) {
         record.Update(
             NIceDb::TUpdate<Schema::ImportItems::Permissions>(item.Permissions->SerializeAsString())
         );
     }
+
     db.Table<Schema::ImportItems>().Key(importInfo.Id, itemIdx).Update(
         NIceDb::TUpdate<Schema::ImportItems::Metadata>(item.Metadata.Serialize())
     );
@@ -311,6 +436,22 @@ void TSchemeShard::LoadTableProfiles(const NKikimrConfig::TTableProfilesConfig* 
     auto waiters = std::move(TableProfilesWaiters);
     for (const auto& [importId, itemIdx] : waiters) {
         Execute(CreateTxProgressImport(importId, itemIdx), ctx);
+    }
+}
+
+bool NeedToBuildIndexes(const TImportInfo& importInfo, ui32 itemIdx) {
+    Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
+    auto& item = importInfo.Items.at(itemIdx);
+
+    switch (importInfo.Settings.index_filling_mode()) {
+        case Ydb::Import::ImportFromS3Settings::INDEX_FILLING_MODE_BUILD:
+            return true;
+        case Ydb::Import::ImportFromS3Settings::INDEX_FILLING_MODE_AUTO:
+            return item.ChildItems.empty();
+        case Ydb::Import::ImportFromS3Settings::INDEX_FILLING_MODE_IMPORT:
+            return false;
+        default:
+            return true;
     }
 }
 

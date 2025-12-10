@@ -90,11 +90,11 @@ TArrayRef<const NIceDb::TUpdateOp> TDataShardUserDb::RemoveDefaultColumnsIfNeede
         // row not exist - no changes need
         return ops;
     }
-    
+
     //newOps is ops without last DefaultFilledColumnCount values
     auto newOps = TArrayRef<const NIceDb::TUpdateOp> (ops.begin(), ops.end() - DefaultFilledColumnCount);
-    
-    return newOps;  
+
+    return newOps;
 }
 
 
@@ -210,6 +210,13 @@ void TDataShardUserDb::UpdateRow(
     Y_ENSURE(localTableId != 0, "Unexpected UpdateRow for an unknown table");
 
     if (!RowExists(tableId, key)) {
+        if (LockTxId) {
+            // We don't perform an update, but this key may be modified later
+            // by a different transaction. Make sure we set the read lock to
+            // guard against that.
+            TSmallVec<TCell> keyCells = ConvertTableKeys(key);
+            Self.SysLocksTable().SetLock(tableId, keyCells);
+        }
         // Compatibility with old stats.
         // We count read only if row exists.
         return;
@@ -235,11 +242,11 @@ void TDataShardUserDb::IncrementRow(
     }
 
     auto currentRow = GetRowState(tableId, key, columns);
-    
+
     if (currentRow.Size() == 0) {
         return;
     }
-    
+
     TStackVec<NIceDb::TUpdateOp> newOps(ops.size());
 
     Y_ENSURE(currentRow.Size() == ops.size());
@@ -250,12 +257,12 @@ void TDataShardUserDb::IncrementRow(
 
     for (size_t i = 0; i < ops.size(); i++) {
         auto vtype = scheme.GetColumnInfo(tableInfo, ops[i].Tag)->PType.GetTypeId();
-       
+
         auto current = currentRow.Get(i);
         auto delta = ops[i].AsCell();
-        
+
         NFormats::AddTwoCells(incrementResults[i], current, delta, vtype);
-            
+
         TRawTypeValue rawTypeValue(incrementResults[i].Data(), incrementResults[i].Size(), vtype);
         newOps[i] = NIceDb::TUpdateOp(ops[i].Tag, ops[i].Op, rawTypeValue);
     }
@@ -276,7 +283,7 @@ void TDataShardUserDb::EraseRow(
     UpsertRowInt(NTable::ERowOp::Erase, tableId, localTableId, key, {});
 
     ui64 keyBytes = CalculateKeyBytes(key);
-    
+
     Counters.NEraseRow++;
     Counters.EraseRowBytes += keyBytes + 8;
 }
@@ -288,12 +295,12 @@ bool TDataShardUserDb::PrechargeRow(
     auto localTableId = Self.GetLocalTableId(tableId);
     Y_ENSURE(localTableId != 0, "Unexpected PrechargeRow for an unknown table");
 
-    return Db.Precharge(localTableId, key, key, {}, 0, Max<ui64>(), Max<ui64>());     
+    return Db.Precharge(localTableId, key, key, {}, 0, Max<ui64>(), Max<ui64>()).Ready;
 }
 
 void TDataShardUserDb::IncreaseUpdateCounters(
-    const TArrayRef<const TRawTypeValue> key, 
-    const TArrayRef<const NIceDb::TUpdateOp> ops) 
+    const TArrayRef<const TRawTypeValue> key,
+    const TArrayRef<const NIceDb::TUpdateOp> ops)
 {
     ui64 valueBytes = CalculateValueBytes(ops);
     ui64 keyBytes = CalculateKeyBytes(key);
@@ -317,7 +324,7 @@ void TDataShardUserDb::UpsertRowInt(
     const TTableId& tableId,
     ui64 localTableId,
     const TArrayRef<const TRawTypeValue> key,
-    const TArrayRef<const NIceDb::TUpdateOp> ops) 
+    const TArrayRef<const NIceDb::TUpdateOp> ops)
 {
     TSmallVec<TCell> keyCells = ConvertTableKeys(key);
 

@@ -563,6 +563,8 @@ class TestViewer(object):
                                     'InstanceGuid',
                                     'WriteThroughput',
                                     'ReadThroughput',
+                                    'StorageSize',
+                                    'StorageCount',
                                     })
 
         # cluster
@@ -573,6 +575,11 @@ class TestViewer(object):
                                     'StorageTotal',
                                     'StorageUsed',
                                     'ROT',
+                                    })
+
+        # tablets
+        replace_with_values.update({'DataSize',
+                                    'IndexSize',
                                     })
 
         # replication
@@ -588,7 +595,7 @@ class TestViewer(object):
     @classmethod
     def normalize_result_healthcheck(cls, result):
         result = cls.replace_values_by_key_and_value(result, ['self_check_result'], ['GOOD', 'DEGRADED', 'MAINTENANCE_REQUIRED', 'EMERGENCY'])
-        cls.delete_keys_recursively(result, ['issue_log'])
+        cls.delete_keys_recursively(result, {'issue_log'})
         return result
 
     @classmethod
@@ -1503,7 +1510,7 @@ class TestViewer(object):
             'Cookie': 'ydb_session_id=' + cls.database_session_id,
         })
 
-        result['down_node_root'] = cls.get_viewer("/tablets/app", params={
+        result['down_node_root'] = cls.post_viewer("/tablets/app", params={
             'TabletID': '72057594037968897',
             'page': 'SetDown',
             'node': '1',
@@ -1511,7 +1518,7 @@ class TestViewer(object):
         }, headers={
             'Cookie': 'ydb_session_id=' + cls.root_session_id,
         })
-        result['down_node_monitoring'] = cls.get_viewer("/tablets/app", params={
+        result['down_node_monitoring'] = cls.post_viewer("/tablets/app", params={
             'TabletID': '72057594037968897',
             'page': 'SetDown',
             'node': '1',
@@ -1519,7 +1526,7 @@ class TestViewer(object):
         }, headers={
             'Cookie': 'ydb_session_id=' + cls.monitoring_session_id,
         })
-        result['down_node_viewer'] = cls.get_viewer("/tablets/app", params={
+        result['down_node_viewer'] = cls.post_viewer("/tablets/app", params={
             'TabletID': '72057594037968897',
             'page': 'SetDown',
             'node': '1',
@@ -1527,7 +1534,7 @@ class TestViewer(object):
         }, headers={
             'Cookie': 'ydb_session_id=' + cls.viewer_session_id,
         })
-        result['down_node_database'] = cls.get_viewer("/tablets/app", params={
+        result['down_node_database'] = cls.post_viewer("/tablets/app", params={
             'TabletID': '72057594037968897',
             'page': 'SetDown',
             'node': '1',
@@ -1581,4 +1588,25 @@ class TestViewer(object):
         }, headers={
             'Cookie': 'ydb_session_id=' + cls.root_session_id,
         }), ['debugMessage'])
+        return result
+
+    @classmethod
+    def test_storage_stats(cls):
+        result = {}
+        tries = 15
+        while tries > 0:
+            result = cls.get_viewer_normalized("/viewer/storage_stats", {
+                'database': cls.dedicated_db,
+                'path': '.,table1,topic1',
+            })
+            if result['Paths'][2]['Groups'] != 0:
+                break
+            tries -= 1
+            time.sleep(1)
+        return result
+
+    @classmethod
+    def test_viewer_peers(cls):
+        result = cls.get_viewer_normalized("/viewer/peers")
+        cls.delete_keys_recursively(result, {'ScopeId', 'PoolStats'})
         return result

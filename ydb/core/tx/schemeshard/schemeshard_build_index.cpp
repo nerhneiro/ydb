@@ -42,6 +42,10 @@ void TSchemeShard::Handle(TEvDataShard::TEvRecomputeKMeansResponse::TPtr& ev, co
     Execute(CreateTxReply(ev), ctx);
 }
 
+void TSchemeShard::Handle(TEvDataShard::TEvFilterKMeansResponse::TPtr& ev, const TActorContext& ctx) {
+    Execute(CreateTxReply(ev), ctx);
+}
+
 void TSchemeShard::Handle(TEvDataShard::TEvLocalKMeansResponse::TPtr& ev, const TActorContext& ctx) {
     Execute(CreateTxReply(ev), ctx);
 }
@@ -59,6 +63,10 @@ void TSchemeShard::Handle(TEvDataShard::TEvValidateUniqueIndexResponse::TPtr& ev
 }
 
 void TSchemeShard::Handle(TEvDataShard::TEvBuildFulltextIndexResponse::TPtr& ev, const TActorContext& ctx) {
+    Execute(CreateTxReply(ev), ctx);
+}
+
+void TSchemeShard::Handle(TEvDataShard::TEvBuildFulltextDictResponse::TPtr& ev, const TActorContext& ctx) {
     Execute(CreateTxReply(ev), ctx);
 }
 
@@ -309,6 +317,17 @@ void TSchemeShard::PersistBuildIndexShardRange(NIceDb::TNiceDb& db, TIndexBuildI
     );
 }
 
+void TSchemeShard::PersistBuildIndexShardStatusFulltext(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus) {
+    db.Table<Schema::IndexBuildShardStatus>().Key(buildId, shardIdx.GetOwnerId(), shardIdx.GetLocalId()).Update(
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::DocCount>(shardStatus.DocCount),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::TotalDocLength>(shardStatus.TotalDocLength),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::FirstToken>(shardStatus.FirstToken),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::LastToken>(shardStatus.LastToken),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::FirstTokenRows>(shardStatus.FirstTokenRows),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::LastTokenRows>(shardStatus.LastTokenRows)
+    );
+}
+
 void TSchemeShard::PersistBuildIndexShardStatusInitiate(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus) {
     NKikimrTx::TKeyRange range;
     shardStatus.Range.Serialize(range);
@@ -329,7 +348,13 @@ void TSchemeShard::PersistBuildIndexShardStatusReset(NIceDb::TNiceDb& db, TIndex
         NIceDb::TUpdate<Schema::IndexBuildShardStatus::UploadBytesProcessed>(shardStatus.Processed.GetUploadBytes()),
         NIceDb::TUpdate<Schema::IndexBuildShardStatus::ReadRowsProcessed>(shardStatus.Processed.GetReadRows()),
         NIceDb::TUpdate<Schema::IndexBuildShardStatus::ReadBytesProcessed>(shardStatus.Processed.GetReadBytes()),
-        NIceDb::TUpdate<Schema::IndexBuildShardStatus::CpuTimeUsProcessed>(shardStatus.Processed.GetCpuTimeUs())
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::CpuTimeUsProcessed>(shardStatus.Processed.GetCpuTimeUs()),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::DocCount>(0),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::TotalDocLength>(0),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::FirstToken>(""),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::LastToken>(""),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::FirstTokenRows>(0),
+        NIceDb::TUpdate<Schema::IndexBuildShardStatus::LastTokenRows>(0)
     );
 }
 

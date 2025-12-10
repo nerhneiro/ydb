@@ -45,6 +45,9 @@ struct TMockHttpRequest : NMonitoring::IMonHttpRequest {
     TStringStream Out;
     TCgiParameters Params;
     THttpHeaders Headers;
+    TMockHttpRequest() {
+        Params.Scan("view=dump");
+    }
     IOutputStream& Output() override {
         return Out;
     }
@@ -564,8 +567,10 @@ struct TAsyncCATestFixture: public NUnitTest::TBaseFixture {
             dqInputChannel->Finish();
         }
         TUnboxedValueBatch batch;
+        TMaybe<TInstant> watermark;
         const auto columns = IsWide ? static_cast<TMultiType*>(dqInputChannel->GetInputType())->GetElementsCount() : static_cast<TStructType*>(dqInputChannel->GetInputType())->GetMembersCount();
-        while (dqInputChannel->Pop(batch)) {
+        while (dqInputChannel->Pop(batch, watermark)) {
+            UNIT_ASSERT(watermark.Empty());
             if (IsWide) {
                 if (!batch.ForEachRowWide([this, cb, columns](const NUdf::TUnboxedValue row[], ui32 width) {
                     LOG_D("WideRow:");
@@ -637,8 +642,8 @@ struct TAsyncCATestFixture: public NUnitTest::TBaseFixture {
     }
 
     void DumpMonPage(auto asyncCA, auto hook) {
+        TMockHttpRequest request;
         {
-            TMockHttpRequest request;
             auto evHttpInfo = MakeHolder<NActors::NMon::TEvHttpInfo>(request);
             ActorSystem.Send(asyncCA, EdgeActor, evHttpInfo.Release());
         }
@@ -749,7 +754,7 @@ struct TAsyncCATestFixture: public NUnitTest::TBaseFixture {
             PushRow(CreateRow(++val, packet), dqOutputChannel);
             PushRow(CreateRow(++val, packet), dqOutputChannel);
             if (watermarkPeriod && packet % watermarkPeriod == 0) {
-                LOG_D("push watermark" << packet);
+                LOG_D("push watermark " << packet);
                 NDqProto::TWatermark watermark;
                 watermark.SetTimestampUs(TInstant::Seconds(packet).MicroSeconds());
                 dqOutputChannel->Push(std::move(watermark));
