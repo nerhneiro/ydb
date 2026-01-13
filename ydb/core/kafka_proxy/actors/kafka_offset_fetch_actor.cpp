@@ -594,9 +594,6 @@ TOffsetFetchResponseData::TOffsetFetchResponseGroup::TOffsetFetchResponseTopics 
                 auto groupPartitionToOffset = (*partitionsToOffsets)[requestPartition].find(groupId);
                 if (groupPartitionToOffset != (*partitionsToOffsets)[requestPartition].end()) {
                     partition.CommittedOffset = groupPartitionToOffset->second.Offset;
-                    if (groupPartitionToOffset->second.Offset == 0) {
-                        partition.CommittedOffset = -1001;
-                    }
                     partition.Metadata = groupPartitionToOffset->second.Metadata;
                     partition.ErrorCode = NONE_ERROR;
                 } else {

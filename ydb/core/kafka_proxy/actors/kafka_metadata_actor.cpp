@@ -266,8 +266,8 @@ void TKafkaMetadataActor::HandleLocationResponse(TEvLocationResponse::TPtr ev, c
                     AddTopicError(topic, ConvertErrorCode(locationResponse->Status));
                 }
             } else  {
-                KAFKA_LOG_D("Sending create topic'" << topic.Name << "' request");
-                TopicСreationAttempts.insert(*topic.Name);
+                KAFKA_LOG_D("Sending create topic '" << topic.Name << "' request");
+                TopicСreationAttempts[*topic.Name] = 0;
                 PendingResponses++;
                 SendCreateTopicsRequest(*topic.Name, index, ctx);
             }

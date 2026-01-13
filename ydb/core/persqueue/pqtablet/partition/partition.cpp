@@ -118,7 +118,7 @@ struct TIsSimpleSharedPtr<TSimpleSharedPtr<U>> : std::true_type {
 
 namespace NKikimr::NPQ {
 
-static const TDuration WAKE_TIMEOUT = TDuration::Seconds(5);
+static const TDuration WAKE_TIMEOUT = TDuration::Seconds(1.5);
 static const TDuration UPDATE_AVAIL_SIZE_INTERVAL = TDuration::MilliSeconds(100);
 static const TDuration MIN_UPDATE_COUNTERS_DELAY = TDuration::MilliSeconds(300);
 static const ui32 MAX_USERS = 1000;
