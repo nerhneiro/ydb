@@ -95,8 +95,8 @@ inline TStringBuilder InputLogMessage(
     return stringBuilder;
 }
 
-inline std::optional<THolder<TEvKafka::TEvTopicModificationResponse>> ValidateTopicConfigName(TString configName) {
-    if (configName == COMPRESSION_TYPE) {
+inline std::optional<THolder<TEvKafka::TEvTopicModificationResponse>> ValidateTopicConfigName(TString configName, std::optional<TString> configValue = std::nullopt) {
+    if (configName == COMPRESSION_TYPE && configValue != "producer") {
         auto result = MakeHolder<TEvKafka::TEvTopicModificationResponse>();
         result->Status = EKafkaErrors::INVALID_REQUEST;
         result->Message = TStringBuilder()

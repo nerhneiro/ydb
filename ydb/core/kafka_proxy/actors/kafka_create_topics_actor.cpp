@@ -227,7 +227,7 @@ void TKafkaCreateTopicsActor::Bootstrap(const NActors::TActorContext& ctx) {
         std::optional<THolder<TEvKafka::TEvTopicModificationResponse>> unsupportedConfigResponse;
 
         for (auto& config : topic.Configs) {
-            unsupportedConfigResponse = ValidateTopicConfigName(config.Name.value());
+            unsupportedConfigResponse = ValidateTopicConfigName(config.Name.value(), config.Value);
             if (unsupportedConfigResponse.has_value()) {
                 break;
             }

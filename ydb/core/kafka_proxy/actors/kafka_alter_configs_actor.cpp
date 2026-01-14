@@ -149,7 +149,7 @@ void TKafkaAlterConfigsActor::Bootstrap(const NActors::TActorContext& ctx) {
         std::optional<THolder<TEvKafka::TEvTopicModificationResponse>> unsupportedConfigResponse;
 
         for (auto& config : resource.Configs) {
-            unsupportedConfigResponse = ValidateTopicConfigName(config.Name.value());
+            unsupportedConfigResponse = ValidateTopicConfigName(config.Name.value(), config.Value);
             if (unsupportedConfigResponse.has_value()) {
                 break;
             }
@@ -261,7 +261,7 @@ void TKafkaAlterConfigsActor::ProcessValidateOnly(const NActors::TActorContext& 
     for (auto& requestResource : Message->Resources) {
         TAlterConfigsResponseData::TAlterConfigsResourceResponse responseResource;
         responseResource.ResourceName = requestResource.ResourceName;
-        responseResource.ResourceType = requestResource.ResourceType;
+        responseResource.ResourceType = TOPIC_RESOURCE_TYPE; //requestResource.ResourceType;
         responseResource.ErrorCode = NONE_ERROR;
         response->Responses.push_back(responseResource);
     }
