@@ -165,31 +165,23 @@ void TKafkaFetchActor::FillRecordsBatch(const NKikimrClient::TPersQueueFetchResp
 
     for (i32 recordIndex = 0; recordIndex < partPQResponse.GetReadResult().GetResult().size(); recordIndex++) {
         auto& result = partPQResponse.GetReadResult().GetResult()[recordIndex];
+        auto fillTimestamp = [&timestampType, &result](ui64& timestampToFill) {
+            if (timestampType.value_or(MESSAGE_TIMESTAMP_CREATE_TIME) == MESSAGE_TIMESTAMP_CREATE_TIME) {
+                timestampToFill = result.GetCreateTimestampMS();
+            } else if (timestampType == MESSAGE_TIMESTAMP_LOG_APPEND) {
+                timestampToFill = result.GetWriteTimestampMS();
+            }
+        };
         if (first) {
             baseOffset = result.GetOffset();
-            if (timestampType.has_value()) {
-                if (timestampType == MESSAGE_TIMESTAMP_LOG_APPEND) {
-                    baseTimestamp = result.GetWriteTimestampMS();
-                } else if (timestampType == MESSAGE_TIMESTAMP_CREATE_TIME) {
-                    baseTimestamp = result.GetCreateTimestampMS();
-                }
-            } else {
-                baseTimestamp = result.GetCreateTimestampMS();
-            }
+            fillTimestamp(baseTimestamp);
             baseSequense = result.GetSeqNo();
             first = false;
         }
 
         lastOffset = result.GetOffset();
-        if (timestampType.has_value()) {
-            if (timestampType == MESSAGE_TIMESTAMP_LOG_APPEND) {
-                lastTimestamp = result.GetWriteTimestampMS();
-            } else if (timestampType == MESSAGE_TIMESTAMP_CREATE_TIME) {
-                lastTimestamp = result.GetCreateTimestampMS();
-            }
-        } else {
-            lastTimestamp = result.GetCreateTimestampMS();
-        }
+        fillTimestamp(lastTimestamp);
+
         auto& record = recordsBatch.Records[recordIndex];
 
         record.DataChunk = NKikimr::GetDeserializedData(result.GetData());
