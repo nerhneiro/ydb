@@ -32,8 +32,27 @@ bool IsPathTypeTable(const NKikimr::NSchemeShard::TExportInfo::TItem& item) {
 
 bool IsPathTypeTransferrable(const NKikimr::NSchemeShard::TExportInfo::TItem& item) {
     return item.SourcePathType == NKikimrSchemeOp::EPathTypeTable
-        || item.SourcePathType == NKikimrSchemeOp::EPathTypeTableIndex;
+        || item.SourcePathType == NKikimrSchemeOp::EPathTypeTableIndex
+        || item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable;
 }
+
+bool IsPathTypeSchemeObject(const NKikimr::NSchemeShard::TExportInfo::TItem& item) {
+    switch (item.SourcePathType) {
+    case NKikimrSchemeOp::EPathTypeView:
+    case NKikimrSchemeOp::EPathTypePersQueueGroup:
+    case NKikimrSchemeOp::EPathTypeReplication:
+    case NKikimrSchemeOp::EPathTypeTransfer:
+    case NKikimrSchemeOp::EPathTypeExternalDataSource:
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <typename T>
+concept HasIncludeIndexData = requires(const T& t) {
+    { t.include_index_data() } -> std::same_as<bool>;
+};
 
 }
 
@@ -115,20 +134,30 @@ struct TSchemeShard::TExport::TTxCreate: public TSchemeShard::TXxport::TTxBase {
 
         TExportInfo::TPtr exportInfo = nullptr;
 
+        auto processExportSettings = [&]<typename TSettings>(const TSettings& settings, TExportInfo::EKind kind, bool enableFeatureFlags) -> bool {
+            exportInfo = new TExportInfo(id, uid, kind, settings, domainPath.Base()->PathId, request.GetPeerName());
+            if constexpr (HasIncludeIndexData<TSettings>) {
+                exportInfo->IncludeIndexData = settings.include_index_data();
+            }
+            if (enableFeatureFlags) {
+                exportInfo->EnableChecksums = AppData()->FeatureFlags.GetEnableChecksumsExport();
+                exportInfo->EnablePermissions = AppData()->FeatureFlags.GetEnablePermissionsExport();
+            }
+            TString explain;
+            if (!FillItems(*exportInfo, settings, explain)) {
+                return Reply(
+                    std::move(response),
+                    Ydb::StatusIds::BAD_REQUEST,
+                    TStringBuilder() << "Failed item check: " << explain
+                );
+            }
+            return false;
+        };
+
         switch (request.GetRequest().GetSettingsCase()) {
         case NKikimrExport::TCreateExportRequest::kExportToYtSettings:
-            {
-                const auto& settings = request.GetRequest().GetExportToYtSettings();
-                exportInfo = new TExportInfo(id, uid, TExportInfo::EKind::YT, settings, domainPath.Base()->PathId, request.GetPeerName());
-
-                TString explain;
-                if (!FillItems(*exportInfo, settings, explain)) {
-                    return Reply(
-                        std::move(response),
-                        Ydb::StatusIds::BAD_REQUEST,
-                        TStringBuilder() << "Failed item check: " << explain
-                    );
-                }
+            if (processExportSettings(request.GetRequest().GetExportToYtSettings(), TExportInfo::EKind::YT, false)) {
+                return true;
             }
             break;
 
@@ -138,27 +167,25 @@ struct TSchemeShard::TExport::TTxCreate: public TSchemeShard::TXxport::TTxBase {
                 if (!settings.scheme()) {
                     settings.set_scheme(Ydb::Export::ExportToS3Settings::HTTPS);
                 }
-
-                exportInfo = new TExportInfo(id, uid, TExportInfo::EKind::S3, settings, domainPath.Base()->PathId, request.GetPeerName());
-                exportInfo->EnableChecksums = AppData()->FeatureFlags.GetEnableChecksumsExport();
-                exportInfo->EnablePermissions = AppData()->FeatureFlags.GetEnablePermissionsExport();
-                exportInfo->MaterializeIndexes = settings.materialize_indexes();
-                if (exportInfo->MaterializeIndexes && !AppData()->FeatureFlags.GetEnableIndexMaterialization()) {
+                if (settings.include_index_data() && !AppData()->FeatureFlags.GetEnableIndexMaterialization()) {
                     return Reply(
                         std::move(response),
                         Ydb::StatusIds::PRECONDITION_FAILED,
                         "Index materialization is not enabled"
                     );
                 }
-
-                TString explain;
-                if (!FillItems(*exportInfo, settings, explain)) {
-                    return Reply(
-                        std::move(response),
-                        Ydb::StatusIds::BAD_REQUEST,
-                        TStringBuilder() << "Failed item check: " << explain
-                    );
+                if (processExportSettings(settings, TExportInfo::EKind::S3, true)) {
+                    return true;
                 }
+            }
+            break;
+
+        case NKikimrExport::TCreateExportRequest::kExportToFsSettings:
+            if (!AppData()->FeatureFlags.GetEnableFsBackups()) {
+                return Reply(std::move(response), Ydb::StatusIds::UNSUPPORTED, "The feature flag \"EnableFsBackups\" is disabled. The operation cannot be performed.");
+            }
+            if (processExportSettings(request.GetRequest().GetExportToFsSettings(), TExportInfo::EKind::FS, true)) {
+                return true;
             }
             break;
 
@@ -181,11 +208,7 @@ struct TSchemeShard::TExport::TTxCreate: public TSchemeShard::TXxport::TTxBase {
         exportInfo->StartTime = TAppData::TimeProvider->Now();
         Self->PersistExportState(db, *exportInfo);
 
-        Self->Exports[id] = exportInfo;
-        if (uid) {
-            Self->ExportsByUid[uid] = exportInfo;
-        }
-
+        Self->AddExport(exportInfo);
         Self->FromXxportInfo(*response->Record.MutableResponse()->MutableEntry(), *exportInfo);
 
         Progress = true;
@@ -235,6 +258,8 @@ private:
 
     template <typename TSettings>
     bool FillItems(TExportInfo& exportInfo, const TSettings& settings, TString& explain) {
+        TVector<TExportInfo::TItem> indexItems;
+
         exportInfo.Items.reserve(settings.items().size());
         for (ui32 itemIdx : xrange(settings.items().size())) {
             const auto& item = settings.items(itemIdx);
@@ -246,6 +271,7 @@ private:
                     .NotDeleted()
                     .NotUnderDeleting()
                     .IsSupportedInExports()
+                    .NotAsyncReplicaTable()
                     .FailOnRestrictedCreateInTempZone();
 
                 if (!checks) {
@@ -257,7 +283,7 @@ private:
             exportInfo.Items.emplace_back(item.source_path(), path.Base()->PathId, path->PathType);
             exportInfo.PendingItems.push_back(exportInfo.Items.size() - 1);
 
-            if (exportInfo.MaterializeIndexes && path.Base()->IsTable()) {
+            if (exportInfo.IncludeIndexData && path.Base()->IsTable()) {
                 for (const auto& [childName, childPathId] : path.Base()->GetChildren()) {
                     TVector<TString> childParts;
                     childParts.push_back(childName);
@@ -268,11 +294,17 @@ private:
                     }
                     for (const auto& [implTableName, implTablePathId] : childPath.Base()->GetChildren()) {
                         const auto implTableRelPath = JoinPath(ChildPath(childParts, implTableName));
-                        exportInfo.Items.emplace_back(implTableRelPath, implTablePathId, childPath->PathType, itemIdx);
-                        exportInfo.PendingItems.push_back(exportInfo.Items.size() - 1);
+                        indexItems.emplace_back(implTableRelPath, implTablePathId, childPath->PathType, itemIdx);
                     }
                 }
             }
+        }
+
+        // Add materialized index items to the end
+        exportInfo.Items.reserve(exportInfo.Items.size() + indexItems.size());
+        for (auto& item : indexItems) {
+            exportInfo.Items.push_back(std::move(item));
+            exportInfo.PendingItems.push_back(exportInfo.Items.size() - 1);
         }
 
         return true;
@@ -404,9 +436,7 @@ private:
         );
 
         Y_ABORT_UNLESS(item.WaitTxId == InvalidTxId);
-        if (item.SourcePathType == NKikimrSchemeOp::EPathTypeView
-            || item.SourcePathType == NKikimrSchemeOp::EPathTypePersQueueGroup)
-        {
+        if (IsPathTypeSchemeObject(item)) {
             Ydb::Export::ExportToS3Settings exportSettings;
             Y_ABORT_UNLESS(exportSettings.ParseFromString(exportInfo.Settings));
             const auto databaseRoot = CanonizePath(Self->RootPathElements);
@@ -719,13 +749,30 @@ private:
             exportInfo.EndTime = TAppData::TimeProvider->Now();
         }
     }
+    
+    TMaybe<TString> GetIssues(const TExportInfo& exportInfo, TTxId backupTxId, ui32 itemIdx) {
+        Y_ABORT_UNLESS(itemIdx < exportInfo.Items.size());
+        const auto& item = exportInfo.Items[itemIdx];
+        if (item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
+            if (!Self->ColumnTables.contains(item.SourcePathId)) {
+                return TStringBuilder() << "Cannot find table: " << item.SourcePathId;
+            }
 
-    TMaybe<TString> GetIssues(const TPathId& itemPathId, TTxId backupTxId) {
+            TColumnTableInfo::TPtr table = Self->ColumnTables.at(item.SourcePathId).GetPtr();
+            return GetIssues(table, item.SourcePathId, backupTxId);
+        }
+
+        auto itemPathId = ItemPathId(Self, exportInfo, itemIdx);
         if (!Self->Tables.contains(itemPathId)) {
             return TStringBuilder() << "Cannot find table: " << itemPathId;
         }
 
         TTableInfo::TPtr table = Self->Tables.at(itemPathId);
+        return GetIssues(table, itemPathId, backupTxId);
+    }
+
+    template <typename TTable>
+    TMaybe<TString> GetIssues(const TTable& table, const TPathId& itemPathId, TTxId backupTxId) {
         if (!table->BackupHistory.contains(backupTxId)) {
             return TStringBuilder() << "Cannot find backup: " << backupTxId << " for table: " << itemPathId;
         }
@@ -842,7 +889,8 @@ private:
                 for (ui32 itemIdx : xrange(exportInfo->Items.size())) {
                     const auto& item = exportInfo->Items.at(itemIdx);
 
-                    if (!IsPathTypeTransferrable(item) || item.State != EState::Dropping) {
+                    // Column Tables must be skiped here
+                    if (!IsPathTypeTransferrable(item) || item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable || item.State != EState::Dropping) {
                         continue;
                     }
 
@@ -1186,7 +1234,8 @@ private:
             Self->PersistExportItemState(db, *exportInfo, itemIdx);
 
             if (AllOf(exportInfo->Items, &TExportInfo::TItem::IsDone)) {
-                if (!AppData()->FeatureFlags.GetEnableExportAutoDropping()) {
+                // TODO (hcpp): support auto dropping after full support for read-only copying for columnar tables. https://github.com/ydb-platform/ydb/issues/26498
+                if (!AppData()->FeatureFlags.GetEnableExportAutoDropping() || item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
                     EndExport(exportInfo, EState::Done, db);
                 } else {
                     PrepareAutoDropping(Self, *exportInfo, db);
@@ -1227,6 +1276,10 @@ private:
         Self->RunningExportSchemeUploaders.erase(std::exchange(exportInfo->ExportMetadataUploader, {}));
 
         if (!exportInfo->IsInProgress()) {
+            LOG_D("TExport::TTxProgress: IsInProgress"
+                << ": id# " << result.ExportId
+                << ", success# " << result.Success
+                << ", error# " << result.Error);
             return;
         }
 
@@ -1246,16 +1299,26 @@ private:
             exportInfo->State = EState::CopyTables;
             AllocateTxId(*exportInfo);
         } else {
-            // None of the items is a table.
+            // None of the items is a column table.
+            TDeque<ui32> columnTables;
             for (ui32 i : xrange(exportInfo->Items.size())) {
-                exportInfo->Items[i].State = EState::Transferring;
+                auto& item = exportInfo->Items[i];
+                item.State = EState::Transferring;
                 Self->PersistExportItemState(db, *exportInfo, i);
 
-                UploadScheme(*exportInfo, i, ctx);
+                // TODO (hcpp): remove after implementing copying of column tables
+                if (item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
+                    columnTables.emplace_back(i);
+                } else {
+                    UploadScheme(*exportInfo, i, ctx);
+                }
             }
 
             exportInfo->State = EState::Transferring;
-            exportInfo->PendingItems.clear();
+            exportInfo->PendingItems = std::move(columnTables);
+            for (ui32 itemIdx : exportInfo->PendingItems) {
+                AllocateTxId(*exportInfo, itemIdx);
+            }
         }
 
         Self->PersistExportState(db, *exportInfo);
@@ -1327,16 +1390,26 @@ private:
                 exportInfo->State = EState::CopyTables;
                 AllocateTxId(*exportInfo);
             } else {
-                // None of the items is a table.
+                // None of the items is a column table.
+                TDeque<ui32> columnTables;
                 for (ui32 i : xrange(exportInfo->Items.size())) {
-                    exportInfo->Items[i].State = EState::Transferring;
+                    auto& item = exportInfo->Items[i];
+                    item.State = EState::Transferring;
                     Self->PersistExportItemState(db, *exportInfo, i);
 
-                    UploadScheme(*exportInfo, i, ctx);
+                    // TODO (hcpp): remove after implementing copying of column tables
+                    if (item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
+                        columnTables.emplace_back(i);
+                    } else {
+                        UploadScheme(*exportInfo, i, ctx);
+                    }
                 }
 
                 exportInfo->State = EState::Transferring;
-                exportInfo->PendingItems.clear();
+                exportInfo->PendingItems = std::move(columnTables);
+                for (ui32 itemIdx : exportInfo->PendingItems) {
+                    AllocateTxId(*exportInfo, itemIdx);
+                }
             }
             break;
         }
@@ -1380,14 +1453,14 @@ private:
 
             bool itemHasIssues = false;
             if (IsPathTypeTransferrable(item)) {
-                if (const auto issue = GetIssues(ItemPathId(Self, *exportInfo, itemIdx), txId)) {
+                if (const auto issue = GetIssues(*exportInfo, txId, itemIdx)) {
                     item.Issue = *issue;
                     Cancel(*exportInfo, itemIdx, "issues during backing up");
                     itemHasIssues = true;
                 }
             }
             if (!itemHasIssues && AllOf(exportInfo->Items, &TExportInfo::TItem::IsDone)) {
-                if (!AppData()->FeatureFlags.GetEnableExportAutoDropping()) {
+                if (!AppData()->FeatureFlags.GetEnableExportAutoDropping() || item.SourcePathType == NKikimrSchemeOp::EPathTypeColumnTable) {
                     exportInfo->State = EState::Done;
                     exportInfo->EndTime = TAppData::TimeProvider->Now();
                 } else {
@@ -1419,11 +1492,6 @@ private:
                     return EndExport(exportInfo, EState::Done, db);
                 }
 
-                if (exportInfo->Uid) {
-                    Self->ExportsByUid.erase(exportInfo->Uid);
-                }
-
-                Self->Exports.erase(exportInfo->Id);
                 Self->PersistRemoveExport(db, *exportInfo);
             }
             return;

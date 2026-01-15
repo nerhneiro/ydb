@@ -1,6 +1,8 @@
 #pragma once
 
 #include "blobstorage_hullwritesst.h"
+#include <ydb/core/blobstorage/vdisk/hulldb/bulksst_add/hulldb_fullsyncsst_add.h>
+#include <ydb/core/util/stlog.h>
 
 namespace NKikimr {
 
@@ -8,20 +10,25 @@ template <class TKey, class TMemRec>
 class TIndexSstWriter {
     using TRec = TIndexRecord<TKey, TMemRec>;
     using TLevelSegment = TLevelSegment<TKey, TMemRec>;
+    using TLevelSegmentPtr = TIntrusivePtr<TLevelSegment>;
+    using TEvAddFullSyncSsts = TEvAddFullSyncSsts<TKey, TMemRec>;
 
     TVDiskContextPtr VCtx;
     TPDiskCtxPtr PDiskCtx;
     TIntrusivePtr<TLevelIndex<TKey, TMemRec>> LevelIndex;
     TQueue<std::unique_ptr<NPDisk::TEvChunkWrite>>& MsgQueue;
 
+    TVector<ui32> Chunks;
+    TVector<TLevelSegmentPtr> LevelSegments;
+
     std::unique_ptr<TBufferedChunkWriter> Writer;
     ui32 Items = 0;
     ui32 ChunkIdx = 0;
     ui64 SstId = 0;
-    TIndexRecord<TKey, TMemRec>::TVec PostponedRecs;
+    TRec::TVec PostponedRecs;
 
     TTrackableVector<TRec> Recs;
-    TIntrusivePtr<TLevelSegment> LevelSegment;
+    TLevelSegmentPtr LevelSegment;
 
     void PutPlaceHolder() {
         auto& info = LevelSegment->Info;
@@ -68,6 +75,14 @@ class TIndexSstWriter {
         Writer->Push(&placeHolder, sizeof(placeHolder));
     }
 
+    void FinishChunk() {
+        PutPlaceHolder();
+        Writer->FinishChunk();
+
+        LevelSegments.push_back(std::move(LevelSegment));
+        Chunks.push_back(ChunkIdx);
+    }
+
 public:
     TIndexSstWriter(
             TVDiskContextPtr vCtx,
@@ -81,7 +96,11 @@ public:
         , Recs(TMemoryConsumer(VCtx->SstIndex))
     {}
 
-    bool Push(const TIndexRecord<TKey, TMemRec>::TVec& records) {
+    bool Push(const TRec::TVec& records) {
+        STLOG(PRI_DEBUG, BS_SYNCER, BSFS20, VDISKP(VCtx->VDiskLogPrefix,
+            "TIndexSstWriter: Push"),
+            (RecordCount, records.size()), (RecordSize, sizeof(TRec)));
+
         if (!Writer) {
             PostponedRecs.insert(PostponedRecs.end(), records.begin(), records.end());
             return false;
@@ -89,6 +108,10 @@ public:
 
         auto freeSpace = Writer->GetFreeSpace();
         auto recsSize = sizeof(TRec) * records.size();
+
+        STLOG(PRI_DEBUG, BS_SYNCER, BSFS21, VDISKP(VCtx->VDiskLogPrefix,
+            "TIndexSstWriter: Push"),
+            (FreeSpace, freeSpace), (Size, recsSize), (RecordSize, sizeof(TRec)));
 
         if (recsSize + sizeof(TIdxDiskPlaceHolder) <= freeSpace) {
             Recs.insert(Recs.end(), records.begin(), records.end());
@@ -108,17 +131,11 @@ public:
         return false;
     }
 
-    void FinishChunk() {
-        PutPlaceHolder();
-        Writer->FinishChunk();
-        Writer.reset();
-    }
-
-    TIntrusivePtr<TLevelSegment> GetSegment() {
-        return std::move(LevelSegment);
-    }
-
     void OnChunkReserved(ui32 chunkIdx) {
+        STLOG(PRI_DEBUG, BS_SYNCER, BSFS22, VDISKP(VCtx->VDiskLogPrefix,
+            "TIndexSstWriter: OnChunkReserved"),
+            (ChunkIdx, chunkIdx), (RecordSize, sizeof(TRec)));
+
         Writer = std::make_unique<TBufferedChunkWriter>(
             TMemoryConsumer(VCtx->SstIndex),
             PDiskCtx->Dsk->Owner,
@@ -131,7 +148,6 @@ public:
             MsgQueue);
 
         Recs.reserve((PDiskCtx->Dsk->ChunkSize - sizeof(TIdxDiskPlaceHolder)) / sizeof(TRec));
-
         LevelSegment = MakeIntrusive<TLevelSegment>(VCtx);
 
         ChunkIdx = chunkIdx;
@@ -141,6 +157,36 @@ public:
         bool ok = Push(PostponedRecs);
         Y_VERIFY_S(ok, VCtx->VDiskLogPrefix);
         PostponedRecs.clear();
+    }
+
+    void Finish() {
+        STLOG(PRI_DEBUG, BS_SYNCER, BSFS23, VDISKP(VCtx->VDiskLogPrefix,
+            "TIndexSstWriter: Finish"),
+            (RecordSize, sizeof(TRec)));
+
+        if (Writer) {
+            FinishChunk();
+        }
+    }
+
+    TActorId GetLevelIndexActorId() const {
+        return LevelIndex->LIActor;
+    }
+
+    std::unique_ptr<TEvAddFullSyncSsts> GenerateCommitMessage(const TActorId sstWriterId) {
+        STLOG(PRI_DEBUG, BS_SYNCER, BSFS24, VDISKP(VCtx->VDiskLogPrefix,
+            "TIndexSstWriter: GenerateCommitMessage"),
+            (ChunkCount, Chunks.size()), (RecordSize, sizeof(TRec)));
+
+        if (!Writer || Chunks.empty()) {
+            return {};
+        }
+
+        auto msg = std::make_unique<TEvAddFullSyncSsts>();
+        msg->CommitChunks = std::move(Chunks);
+        msg->LevelSegments = std::move(LevelSegments);
+        msg->SstWriterId = sstWriterId;
+        return std::move(msg);
     }
 };
 

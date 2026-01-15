@@ -1281,7 +1281,7 @@ TTableSchemaPtr TTableSchema::ToSorted(const TKeyColumns& keyColumns) const
     for (const auto& keyColumn : keyColumns) {
         sortColumns.push_back(TColumnSortSchema{
             .Name = keyColumn,
-            .SortOrder = ESortOrder::Ascending
+            .SortOrder = ESortOrder::Ascending,
         });
     }
 
@@ -2003,10 +2003,11 @@ void ValidateColumnSchema(
                 options);
         }
 
-        {
-            TComplexTypeFieldDescriptor descriptor(name, columnSchema.LogicalType());
-            ValidateLogicalType(descriptor, MaxSchemaDepth);
-        }
+        ValidateLogicalType(
+            TComplexTypeFieldDescriptor(name, columnSchema.LogicalType()),
+            TLogicalTypeValidationOptions{
+                .DepthLimit = MaxSchemaDepth,
+            });
 
         if (!IsComparable(columnSchema.LogicalType()) &&
             columnSchema.SortOrder() &&

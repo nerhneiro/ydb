@@ -1,6 +1,7 @@
 #include "schemeshard__shred_manager.h"
 #include "schemeshard_impl.h"
-#include "schemeshard_utils.h"  // for PQGroupReserve
+#include "schemeshard_index_build_info.h"
+#include "schemeshard_pq_helpers.h"  // for PQGroupReserve
 
 #include <ydb/core/protos/s3_settings.pb.h>
 #include <ydb/core/protos/table_stats.pb.h>  // for TStoragePoolsStats
@@ -4047,7 +4048,8 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 auto& sid = *securityState.AddSids();
                 sid.SetName(rowset.GetValue<Schema::LoginSids::SidName>());
                 sid.SetType(rowset.GetValue<Schema::LoginSids::SidType>());
-                sid.SetHash(rowset.GetValue<Schema::LoginSids::SidHash>());
+                sid.SetArgonHash(rowset.GetValue<Schema::LoginSids::SidHash>());
+                sid.SetPasswordHashes(rowset.GetValue<Schema::LoginSids::PasswordHashes>());
                 sid.SetCreatedAt(rowset.GetValueOrDefault<Schema::LoginSids::CreatedAt>());
                 sid.SetFailedLoginAttemptCount(rowset.GetValueOrDefault<Schema::LoginSids::FailedAttemptCount>());
                 sid.SetLastFailedLogin(rowset.GetValueOrDefault<Schema::LoginSids::LastFailedAttempt>());
@@ -4457,16 +4459,13 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     exportInfo->EndTime = TInstant::Seconds(rowset.GetValueOrDefault<Schema::Exports::EndTime>());
                     exportInfo->EnableChecksums = rowset.GetValueOrDefault<Schema::Exports::EnableChecksums>(false);
                     exportInfo->EnablePermissions = rowset.GetValueOrDefault<Schema::Exports::EnablePermissions>(false);
-                    exportInfo->MaterializeIndexes = rowset.GetValueOrDefault<Schema::Exports::MaterializeIndexes>(false);
+                    exportInfo->IncludeIndexData = rowset.GetValueOrDefault<Schema::Exports::IncludeIndexData>(false);
 
                     if (rowset.HaveValue<Schema::Exports::ExportMetadata>()) {
                         exportInfo->ExportMetadata = rowset.GetValue<Schema::Exports::ExportMetadata>();
                     }
 
-                    Self->Exports[id] = exportInfo;
-                    if (uid) {
-                        Self->ExportsByUid[uid] = exportInfo;
-                    }
+                    Self->AddExport(exportInfo);
 
                     if (exportInfo->WaitTxId != InvalidTxId) {
                         Self->TxIdToExport[exportInfo->WaitTxId] = {id, Max<ui32>()};
@@ -4543,9 +4542,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                                                 rowset.GetValue<Schema::Imports::DomainPathLocalId>());
                     TString peerName = rowset.GetValueOrDefault<Schema::Imports::PeerName>();
 
-                    Ydb::Import::ImportFromS3Settings settings;
-                    Y_ABORT_UNLESS(ParseFromStringNoSizeLimit(settings, rowset.GetValue<Schema::Imports::Settings>()));
-
+                    TString settings = rowset.GetValue<Schema::Imports::Settings>();
                     TImportInfo::TPtr importInfo = new TImportInfo(id, uid, kind, settings, domainPathId, peerName);
 
                     if (rowset.HaveValue<Schema::Imports::UserSID>()) {
@@ -4562,10 +4559,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                     importInfo->StartTime = TInstant::Seconds(rowset.GetValueOrDefault<Schema::Imports::StartTime>());
                     importInfo->EndTime = TInstant::Seconds(rowset.GetValueOrDefault<Schema::Imports::EndTime>());
 
-                    Self->Imports[id] = importInfo;
-                    if (uid) {
-                        Self->ImportsByUid[uid] = importInfo;
-                    }
+                    Self->AddImport(importInfo);
 
                     switch (importInfo->State) {
                     case TImportInfo::EState::DownloadExportMetadata:
@@ -4705,7 +4699,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         "Init " << stepName << " BuildInfo not found: id#" << id);
                     return;
                 }
-                auto& buildInfo = *buildInfoPtr->Get();
+                auto& buildInfo = *buildInfoPtr->get();
                 if (!buildInfo.IsBroken) {
                     fillBuildInfoSafe(buildInfo, stepName, fill);
                 }
@@ -4719,23 +4713,28 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                 }
 
                 while (!rowset.EndOfSet()) {
-                    TIndexBuildInfo::TPtr buildInfo = new TIndexBuildInfo();
+                    auto buildInfo = std::make_shared<TIndexBuildInfo>();
                     fillBuildInfoSafe(*buildInfo, "IndexBuild", [&](TIndexBuildInfo& buildInfo) {
                         TIndexBuildInfo::FillFromRow(rowset, &buildInfo);
                     });
 
-                    if (!Self->EnableVectorIndex) { // prevent build index from progress
+                    if (buildInfo->IsBuildColumns()) {
+                        if (!Self->PathsById.contains(buildInfo->TablePathId)) {
+                            buildInfo->IsBroken = true;
+                            buildInfo->AddIssue(TStringBuilder() << "Table path id not found: " << buildInfo->TablePathId.ToString());
+                        }
+
+                        buildInfo->TargetName = TPath::Init(buildInfo->TablePathId, Self).PathString();
+                    }
+
+                    // prevent build index from progress
+                    if (buildInfo->IsBuildVectorIndex() && !Self->EnableVectorIndex) {
                         buildInfo->IsBroken = true;
+                        buildInfo->AddIssue(TStringBuilder() << "Vector index is not enabled");
                     }
 
                     // Note: broken build are also added to IndexBuilds
-                    Y_ASSERT(!Self->IndexBuilds.contains(buildInfo->Id));
-                    Self->IndexBuilds[buildInfo->Id] = buildInfo;
-
-                    if (buildInfo->Uid) {
-                        Y_ASSERT(!Self->IndexBuildsByUid.contains(buildInfo->Uid));
-                        Self->IndexBuildsByUid[buildInfo->Uid] = buildInfo;
-                    }
+                    Self->AddIndexBuild(buildInfo);
 
                     OnComplete.ToProgress(buildInfo->Id);
 

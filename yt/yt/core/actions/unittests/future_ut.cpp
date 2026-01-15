@@ -92,7 +92,7 @@ TEST_F(TFutureTest, VoidUniqueApply)
 
 TEST_F(TFutureTest, WellKnownUniqueFuture)
 {
-    auto future = VoidFuture.AsUnique();
+    auto future = OKFuture.AsUnique();
     // Multiple subscriptions are fine.
     EXPECT_TRUE(future.IsSet());
     EXPECT_TRUE(future.Get().IsOK());
@@ -119,7 +119,7 @@ TEST_F(TFutureTest, NoncopyableGet)
 {
     auto f = MakeFuture<std::unique_ptr<int>>(std::make_unique<int>(1));
     EXPECT_TRUE(f.IsSet());
-    auto result =  f.AsUnique().Get();
+    auto result = f.AsUnique().Get();
     EXPECT_TRUE(result.IsOK());
     EXPECT_EQ(1, *result.Value());
 }
@@ -210,7 +210,7 @@ TEST_F(TFutureTest, NoncopyableApply7)
 
 TEST_F(TFutureTest, NoncopyableApply8)
 {
-    auto f = VoidFuture;
+    auto f = OKFuture;
     auto g = f.Apply(BIND([] {
         return MakeFuture<std::unique_ptr<double>>(nullptr).AsUnique();
     }));
@@ -260,7 +260,7 @@ TEST_F(TFutureTest, NoncopyableApplySO5086)
 TEST_F(TFutureTest, NonAssignable1)
 {
     auto f = MakeFuture<TNonAssignable>({
-        .Value = 1
+        .Value = 1,
     });
 
     auto g = f.AsUnique().Apply(BIND([] (TNonAssignable&& object) {
@@ -274,7 +274,7 @@ TEST_F(TFutureTest, NonAssignable1)
 TEST_F(TFutureTest, NonAssignable2)
 {
     auto f = MakeFuture<TNonAssignable>({
-        .Value = 1
+        .Value = 1,
     });
 
     std::vector<decltype(f)> futures;
@@ -295,7 +295,7 @@ TEST_F(TFutureTest, NonAssignable2)
 TEST_F(TFutureTest, NonAssignable3)
 {
     auto f = MakeFuture<TNonAssignable>({
-        .Value = 1
+        .Value = 1,
     });
 
     std::vector<decltype(f)> futures;
@@ -373,7 +373,7 @@ TEST_F(TFutureTest, IsNull)
 TEST_F(TFutureTest, IsNullVoid)
 {
     TFuture<void> empty;
-    TFuture<void> nonEmpty = VoidFuture;
+    TFuture<void> nonEmpty = OKFuture;
 
     EXPECT_FALSE(empty);
     EXPECT_TRUE(nonEmpty);
@@ -922,6 +922,64 @@ TEST_F(TFutureTest, TestCancelDelayed)
     EXPECT_FALSE(future.Get().IsOK());
 }
 
+TEST_F(TFutureTest, CancelDoesntSpuriouslyFail)
+{
+    constexpr auto timeLimit = TDuration::Seconds(10);
+    const auto t0 = TInstant::Now();
+
+    std::atomic<i64> counter = 0;
+
+    auto wait = [&counter] (i64 expected) -> i64 {
+        while (true) {
+            auto value = counter.load();
+            if (value == expected || value == -1) {
+                return value;
+            }
+        }
+    };
+
+    TPromise<void>* promisePtr = nullptr;
+
+    auto setter = [&] () {
+        i64 i = 0;
+        while (true) {
+            ++i;
+            if (wait(i) == -1) {
+                return;
+            }
+
+            promisePtr->Set();
+
+            ++i;
+            counter.fetch_add(1);
+        }
+    };
+
+    ::TThread thread(setter);
+    thread.Start();
+
+    i64 i = 0;
+    while (TInstant::Now() - t0 < timeLimit) {
+        auto promise = NewPromise<void>();
+        auto future = promise.ToFuture().AsCancelable();
+        promisePtr = &promise;
+
+        ++i;
+        counter.fetch_add(1);
+
+        bool cancelSuccess = future.Cancel(TError());
+
+        EXPECT_EQ(cancelSuccess, promise.IsCanceled());
+
+        ++i;
+        wait(i);
+
+        promisePtr = nullptr;
+    }
+
+    counter.store(-1);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 TEST_F(TFutureTest, AnyCombiner)
@@ -1171,7 +1229,7 @@ TEST_F(TFutureTest, AllCombinerCancel)
 TEST_F(TFutureTest, AllCombinerVoid0)
 {
     std::vector<TFuture<void>> futures;
-    EXPECT_EQ(VoidFuture, AllSucceeded(futures));
+    EXPECT_EQ(OKFuture, AllSucceeded(futures));
 }
 
 TEST_F(TFutureTest, AllCombinerVoid1)

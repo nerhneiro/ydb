@@ -49,6 +49,7 @@ struct TYqlTableRefArgs {
     TString Service;
     TString Cluster;
     TString Key;
+    bool IsAnonymous = false;
 };
 
 struct TYqlValuesArgs {
@@ -62,8 +63,13 @@ struct TYqlSelectArgs {
     TMaybe<TNodePtr> Limit;
     TMaybe<TNodePtr> Offset;
     TMaybe<TGroupBy> GroupBy;
+    TMaybe<TNodePtr> Having;
     TMaybe<TOrderBy> OrderBy;
 };
+
+TNodePtr GetYqlSource(const TNodePtr& node);
+
+TNodePtr ToTableExpression(TNodePtr source);
 
 TNodePtr BuildYqlTableRef(TPosition position, TYqlTableRefArgs&& args);
 

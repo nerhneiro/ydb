@@ -838,10 +838,9 @@ public:
 
                 NKqp::TKqpTranslationSettingsBuilder settingsBuilder(
                     SessionCtx->Query().Type,
-                    SessionCtx->Config()._KqpYqlSyntaxVersion.Get().GetRef(),
                     cluster,
                     viewData.QueryText,
-                    SessionCtx->Config().BindingsMode,
+                    SessionCtx->Config().GetYqlBindingsMode(),
                     GUCSettings
                 );
                 settingsBuilder.SetFromConfig(SessionCtx->Config());
@@ -909,6 +908,7 @@ public:
                     .Build()
                 .Columns(result.Columns())
                 .RowsLimit().Build(ToString(rowsLimit))
+                .Discard(result.Discard())
                 .Done();
 
             auto newResults = ctx.ChangeChild(results.Ref(), index - startBlockIndex, newResult.Ptr());

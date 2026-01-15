@@ -140,6 +140,10 @@ void TSchemeShard::FromXxportInfo(NKikimrExport::TExport& exprt, const TExportIn
         exprt.MutableExportToS3Settings()->clear_access_key();
         exprt.MutableExportToS3Settings()->clear_secret_key();
         break;
+
+    case TExportInfo::EKind::FS:
+        Y_ABORT_UNLESS(exprt.MutableExportToFsSettings()->ParseFromString(exportInfo.Settings));
+        break;
     }
 }
 
@@ -153,7 +157,7 @@ void TSchemeShard::PersistCreateExport(NIceDb::TNiceDb& db, const TExportInfo& e
         NIceDb::TUpdate<Schema::Exports::Items>(exportInfo.Items.size()),
         NIceDb::TUpdate<Schema::Exports::EnableChecksums>(exportInfo.EnableChecksums),
         NIceDb::TUpdate<Schema::Exports::EnablePermissions>(exportInfo.EnablePermissions),
-        NIceDb::TUpdate<Schema::Exports::MaterializeIndexes>(exportInfo.MaterializeIndexes),
+        NIceDb::TUpdate<Schema::Exports::IncludeIndexData>(exportInfo.IncludeIndexData),
         NIceDb::TUpdate<Schema::Exports::PeerName>(exportInfo.PeerName),
         NIceDb::TUpdate<Schema::Exports::SanitizedToken>(exportInfo.SanitizedToken)
     );
@@ -178,7 +182,21 @@ void TSchemeShard::PersistCreateExport(NIceDb::TNiceDb& db, const TExportInfo& e
     }
 }
 
+void TSchemeShard::AddExport(const TExportInfo::TPtr& exportInfo) {
+    Exports[exportInfo->Id] = exportInfo;
+    ExportsByTime.emplace(exportInfo->StartTime, exportInfo->Id);
+    if (exportInfo->Uid) {
+        ExportsByUid[exportInfo->Uid] = exportInfo;
+    }
+}
+
 void TSchemeShard::PersistRemoveExport(NIceDb::TNiceDb& db, const TExportInfo& exportInfo) {
+    if (exportInfo.Uid) {
+        ExportsByUid.erase(exportInfo.Uid);
+    }
+    ExportsByTime.erase(std::make_pair(exportInfo.StartTime, exportInfo.Id));
+    Exports.erase(exportInfo.Id);
+
     for (ui32 itemIdx : xrange(exportInfo.Items.size())) {
         db.Table<Schema::ExportItems>().Key(exportInfo.Id, itemIdx).Delete();
     }

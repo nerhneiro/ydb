@@ -9,9 +9,9 @@ namespace NKikimr::NOlap::NReader::NCommon {
 
 class TDataSourceConstructor: public ICursorEntity, public TMoveOnly {
 private:
-    ui32 SourceId = 0;
     TReplaceKeyAdapter Start;
     TReplaceKeyAdapter Finish;
+    bool IsOutOfOrder;
     ui32 SourceIdx = 0;
     bool SourceIdxInitialized = false;
 
@@ -20,10 +20,6 @@ private:
     }
 
 public:
-    ui32 GetSourceId() const {
-        return SourceId;
-    }
-
     void SetIndex(const ui32 index) {
         AFL_VERIFY(!SourceIdxInitialized);
         SourceIdxInitialized = true;
@@ -43,12 +39,11 @@ public:
         return std::move(Finish);
     }
 
-    TDataSourceConstructor(const ui32 sourceId, TReplaceKeyAdapter&& start, TReplaceKeyAdapter&& finish)
-        : SourceId(sourceId)
-        , Start(std::move(start))
+    TDataSourceConstructor(TReplaceKeyAdapter&& start, TReplaceKeyAdapter&& finish, const bool isOutOfOrder)
+        : Start(std::move(start))
         , Finish(std::move(finish))
+        , IsOutOfOrder(isOutOfOrder)
     {
-        AFL_VERIFY(SourceId);
     }
 
     const TReplaceKeyAdapter& GetStart() const {
@@ -58,19 +53,75 @@ public:
         return Finish;
     }
 
-    class TComparator {
+    virtual bool QueryAgnosticLess(const TDataSourceConstructor& rhs) const = 0;
+    virtual ~TDataSourceConstructor() = default;
+
+    TDataSourceConstructor(TDataSourceConstructor&& other)
+        : Start(std::move(other.Start))
+        , Finish(std::move(other.Finish))
+        , IsOutOfOrder(other.IsOutOfOrder)
+        , SourceIdx(other.SourceIdx)
+        , SourceIdxInitialized(other.SourceIdxInitialized)
+    {
+    }
+
+    TDataSourceConstructor& operator=(TDataSourceConstructor&& other) {
+        Start = std::move(other.Start);
+        Finish = std::move(other.Finish);
+        IsOutOfOrder = other.IsOutOfOrder;
+        SourceIdx = other.SourceIdx;
+        SourceIdxInitialized = other.SourceIdxInitialized;
+        return *this;
+    }
+
+    class TLessByStart {
+    public:
+        bool operator()(const TDataSourceConstructor& l, const TDataSourceConstructor& r) const {
+            auto cmp = l.Start.Compare(r.Start);
+            if (cmp == std::partial_ordering::less) {
+                return true;
+            } else if (cmp == std::partial_ordering::greater) {
+                return false;
+            } else {
+                return l.QueryAgnosticLess(r);
+            }
+        }
+    };
+
+    class TSimpleLess {
+    public:
+        bool operator()(const TDataSourceConstructor& l, const TDataSourceConstructor& r) const {
+            return l.QueryAgnosticLess(r);
+        }
+    };
+
+    class TReversedComparator {
     private:
-        const ERequestSorting Sorting;
+        ERequestSorting Sorting;
 
     public:
-        TComparator(const ERequestSorting sorting)
+        TReversedComparator(const ERequestSorting sorting)
             : Sorting(sorting)
         {
-            AFL_VERIFY(Sorting != ERequestSorting::NONE);
         }
 
         bool operator()(const TDataSourceConstructor& l, const TDataSourceConstructor& r) const {
-            return std::make_pair(r.Start, r.SourceId) < std::make_pair(l.Start, l.SourceId);
+            if (l.IsOutOfOrder || r.IsOutOfOrder) {
+                if (!r.IsOutOfOrder) {
+                    return true;
+                }
+                if (!l.IsOutOfOrder) {
+                    return false;
+                }
+                return false;
+            }
+            switch (Sorting) {
+                case ERequestSorting::NONE:
+                    return TSimpleLess()(r, l);
+                case ERequestSorting::ASC:
+                case ERequestSorting::DESC:
+                    return TLessByStart()(r, l);
+            }
         }
     };
 };
@@ -86,7 +137,8 @@ private:
 
 public:
     TOrderedObjects(const ERequestSorting sorting)
-        : Sorting(sorting) {
+        : Sorting(sorting)
+    {
     }
 
     ERequestSorting GetSorting() const {
@@ -112,27 +164,16 @@ public:
     void Initialize(std::deque<TObject>&& objects) {
         AFL_VERIFY(!Initialized);
         Initialized = true;
-        if (Sorting != ERequestSorting::NONE) {
-            HeapObjects = std::move(objects);
-            std::make_heap(HeapObjects.begin(), HeapObjects.end(), typename TObject::TComparator(Sorting));
-        } else {
-            AlreadySorted = std::move(objects);
-            for (auto& source : AlreadySorted) {
-                source.SetIndex(NextObjectIdx++);
-            }
-        }
+        HeapObjects = std::move(objects);
+        std::make_heap(HeapObjects.begin(), HeapObjects.end(), typename TObject::TReversedComparator(Sorting));
     }
 
     void PrepareOrdered(const ui32 count) {
-        if (Sorting != ERequestSorting::NONE) {
-            while (AlreadySorted.size() < count && HeapObjects.size()) {
-                std::pop_heap(HeapObjects.begin(), HeapObjects.end(), typename TObject::TComparator(Sorting));
-                HeapObjects.back().SetIndex(NextObjectIdx++);
-                AlreadySorted.emplace_back(std::move(HeapObjects.back()));
-                HeapObjects.pop_back();
-            }
-        } else {
-            AFL_VERIFY(HeapObjects.empty());
+        while (AlreadySorted.size() < count && HeapObjects.size()) {
+            std::pop_heap(HeapObjects.begin(), HeapObjects.end(), typename TObject::TReversedComparator(Sorting));
+            HeapObjects.back().SetIndex(NextObjectIdx++);
+            AlreadySorted.emplace_back(std::move(HeapObjects.back()));
+            HeapObjects.pop_back();
         }
     }
 

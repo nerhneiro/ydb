@@ -32,6 +32,20 @@ public:
         return Build(partial);
     }
 
+    TNodeResult Build(const TRule_select_unparenthesized_stmt& rule) {
+        const auto& intersect = rule.GetRule_select_unparenthesized_stmt_intersect1();
+        if (!rule.GetBlock2().empty()) {
+            return Unsupported("(union_op select_stmt_intersect)*");
+        }
+
+        const auto& partial = intersect.GetRule_select_kind_partial1();
+        if (!intersect.GetBlock2().empty()) {
+            return Unsupported("(intersect_op select_kind_parenthesis)*");
+        }
+
+        return Build(partial);
+    }
+
     TNodeResult Build(const TRule_values_stmt& rule) {
         TYqlValuesArgs values;
 
@@ -223,7 +237,11 @@ private:
 
         if (rule.HasBlock12()) {
             Token(rule.GetBlock12().GetToken1());
-            return Unsupported("HAVING expr");
+            if (auto result = Build(rule.GetBlock12().GetRule_expr2(), EColumnRefState::Allow)) {
+                select.Having = std::move(*result);
+            } else {
+                return std::unexpected(result.error());
+            }
         }
 
         if (rule.HasBlock13()) {
@@ -311,8 +329,12 @@ private:
             return std::unexpected(expr.error());
         }
 
-        if (const auto label = Label(alt)) {
-            (*expr)->SetLabel(*label);
+        if (auto result = Label(alt)) {
+            if (*result) {
+                (*expr)->SetLabel(*(*result));
+            }
+        } else {
+            return std::unexpected(result.error());
         }
 
         return expr;
@@ -417,16 +439,10 @@ private:
             case TRule_join_op_TAlt2_TBlock2::kAlt1:
                 break;
             case TRule_join_op_TAlt2_TBlock2::kAlt2:
-                YQL_ENSURE(IS_TOKEN(
-                    Ctx_.Settings.Antlr4Parser,
-                    block.GetAlt2().GetToken1().GetId(),
-                    INNER));
+                YQL_ENSURE(IS_TOKEN(block.GetAlt2().GetToken1().GetId(), INNER));
                 return EYqlJoinKind::Inner;
             case TRule_join_op_TAlt2_TBlock2::kAlt3:
-                YQL_ENSURE(IS_TOKEN(
-                    Ctx_.Settings.Antlr4Parser,
-                    block.GetAlt3().GetToken1().GetId(),
-                    CROSS));
+                YQL_ENSURE(IS_TOKEN(block.GetAlt3().GetToken1().GetId(), CROSS));
                 return EYqlJoinKind::Cross;
             case TRule_join_op_TAlt2_TBlock2::ALT_NOT_SET:
                 Y_UNREACHABLE();
@@ -443,10 +459,7 @@ private:
                         return Unsupported("(ONLY | SEMI)");
                     }
 
-                    YQL_ENSURE(IS_TOKEN(
-                        Ctx_.Settings.Antlr4Parser,
-                        block.GetAlt1().GetToken1().GetId(),
-                        LEFT));
+                    YQL_ENSURE(IS_TOKEN(block.GetAlt1().GetToken1().GetId(), LEFT));
                     return EYqlJoinKind::Left;
                 }
                 case TRule_join_op_TAlt2_TBlock2_TAlt1_TBlock1::kAlt2: {
@@ -456,23 +469,14 @@ private:
                         return Unsupported("(ONLY | SEMI)");
                     }
 
-                    YQL_ENSURE(IS_TOKEN(
-                        Ctx_.Settings.Antlr4Parser,
-                        block.GetAlt2().GetToken1().GetId(),
-                        RIGHT));
+                    YQL_ENSURE(IS_TOKEN(block.GetAlt2().GetToken1().GetId(), RIGHT));
                     return EYqlJoinKind::Right;
                 }
                 case TRule_join_op_TAlt2_TBlock2_TAlt1_TBlock1::kAlt3:
-                    YQL_ENSURE(IS_TOKEN(
-                        Ctx_.Settings.Antlr4Parser,
-                        block.GetAlt3().GetToken1().GetId(),
-                        EXCLUSION));
+                    YQL_ENSURE(IS_TOKEN(block.GetAlt3().GetToken1().GetId(), EXCLUSION));
                     return Unsupported("EXCLUSION");
                 case TRule_join_op_TAlt2_TBlock2_TAlt1_TBlock1::kAlt4:
-                    YQL_ENSURE(IS_TOKEN(
-                        Ctx_.Settings.Antlr4Parser,
-                        block.GetAlt4().GetToken1().GetId(),
-                        FULL));
+                    YQL_ENSURE(IS_TOKEN(block.GetAlt4().GetToken1().GetId(), FULL));
                     return Unsupported("FULL");
                 case TRule_join_op_TAlt2_TBlock2_TAlt1_TBlock1::ALT_NOT_SET:
                     Y_UNREACHABLE();
@@ -480,10 +484,7 @@ private:
         }
 
         if (alt1.HasBlock2()) {
-            YQL_ENSURE(IS_TOKEN(
-                Ctx_.Settings.Antlr4Parser,
-                alt1.GetBlock2().GetToken1().GetId(),
-                OUTER));
+            YQL_ENSURE(IS_TOKEN(alt1.GetBlock2().GetToken1().GetId(), OUTER));
             return Unsupported("OUTER");
         }
 
@@ -539,7 +540,13 @@ private:
             const auto& block = rule.GetBlock3();
 
             source.Alias.ConstructInPlace();
-            source.Alias->Name = TableAlias(block.GetBlock1());
+
+            if (auto name = TableAlias(block.GetBlock1())) {
+                source.Alias->Name = std::move(*name);
+            } else {
+                return std::unexpected(ESQLError::Basic);
+            }
+
             if (block.HasBlock2()) {
                 source.Alias->Columns = TableColumns(block.GetBlock2().GetRule_pure_column_list1());
             }
@@ -566,42 +573,63 @@ private:
     }
 
     TNodeResult Build(const TRule_table_ref& rule) {
+        const bool isCluterExplicit = rule.HasBlock1();
+
         TString service = Ctx_.Scoped->CurrService;
         TDeferredAtom cluster = Ctx_.Scoped->CurrCluster;
 
-        if (rule.HasBlock1()) {
+        if (isCluterExplicit) {
             const auto& expr = rule.GetBlock1().GetRule_cluster_expr1();
             if (!ClusterExpr(expr, /* allowWildcard = */ false, service, cluster)) {
                 return std::unexpected(ESQLError::Basic);
             }
         }
 
-        if (rule.HasBlock2()) {
-            Token(rule.GetBlock2().GetToken1());
-            return Unsupported("COMMAT");
-        }
+        const bool isAnonymous = rule.HasBlock2();
 
         if (rule.HasBlock4()) {
             return Unsupported("table_hints");
         }
 
-        return Build(rule.GetBlock3(), std::move(service), std::move(cluster));
+        return Build(
+            rule.GetBlock3(),
+            std::move(service),
+            std::move(cluster),
+            isAnonymous,
+            isCluterExplicit);
     }
 
-    TNodeResult Build(const TRule_table_ref::TBlock3& block, TString service, TDeferredAtom cluster) {
+    TNodeResult Build(
+        const TRule_table_ref::TBlock3& block,
+        TString service,
+        TDeferredAtom cluster,
+        bool isAnonymous,
+        bool isClusterExplicit)
+    {
         switch (block.GetAltCase()) {
             case TRule_table_ref_TBlock3::kAlt1:
-                return Build(block.GetAlt1().GetRule_table_key1(), std::move(service), std::move(cluster));
+                return Build(
+                    block.GetAlt1().GetRule_table_key1(),
+                    std::move(service),
+                    std::move(cluster),
+                    isAnonymous);
             case TRule_table_ref_TBlock3::kAlt2:
                 return Unsupported("an_id_expr LPAREN (table_arg (COMMA table_arg)* COMMA?)? RPAREN");
             case TRule_table_ref_TBlock3::kAlt3:
-                return Unsupported("bind_parameter (LPAREN expr_list? RPAREN)? (VIEW view_name)?");
+                return Build(
+                    block.GetAlt3(),
+                    isAnonymous,
+                    isClusterExplicit);
             case TRule_table_ref_TBlock3::ALT_NOT_SET:
                 Y_UNREACHABLE();
         }
     }
 
-    TNodeResult Build(const TRule_table_key& rule, TString service, TDeferredAtom cluster) {
+    TNodeResult Build(
+        const TRule_table_key& rule,
+        TString service,
+        TDeferredAtom cluster,
+        bool isAnonymous) {
         if (cluster.Empty()) {
             Ctx_.Error() << "No cluster name given and no default cluster is selected";
             return std::unexpected(ESQLError::Basic);
@@ -621,9 +649,39 @@ private:
             .Service = std::move(service),
             .Cluster = *cluster.GetLiteral(),
             .Key = std::move(key),
+            .IsAnonymous = isAnonymous,
         };
 
         return TNonNull(BuildYqlTableRef(Ctx_.Pos(), std::move(args)));
+    }
+
+    TNodeResult Build(
+        const TRule_table_ref::TBlock3::TAlt3& alt,
+        bool isAnonymous,
+        bool isClusterExplicit)
+    {
+        const auto& bindParameter = alt.GetRule_bind_parameter1();
+        Token(bindParameter.GetToken1());
+
+        if (isAnonymous) {
+            return Unsupported("COMMAT bind_parameter");
+        }
+
+        if (isClusterExplicit) {
+            return Unsupported("cluster_expr DOT bind_parameter");
+        }
+
+        TString name;
+        if (!NamedNodeImpl(bindParameter, name, *this)) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        TNodePtr node = GetNamedNode(name);
+        if (!node) {
+            return std::unexpected(ESQLError::Basic);
+        }
+
+        return TNonNull(node);
     }
 
     TSQLResult<TVector<TNodePtr>> Build(const TRule_values_source_row& rule) {
@@ -728,7 +786,7 @@ private:
         return sqlExpr.Build(rule);
     }
 
-    TMaybe<TString> Label(const TRule_result_column::TAlt2& rule) {
+    TSQLResult<TMaybe<TString>> Label(const TRule_result_column::TAlt2& rule) {
         if (!rule.HasBlock2()) {
             return Nothing();
         }
@@ -737,8 +795,17 @@ private:
         switch (block.Alt_case()) {
             case TRule_result_column_TAlt2_TBlock2::kAlt1:
                 return Id(block.GetAlt1().GetRule_an_id_or_type2(), *this);
-            case TRule_result_column_TAlt2_TBlock2::kAlt2:
+            case TRule_result_column_TAlt2_TBlock2::kAlt2: {
+                if (!Ctx_.AnsiOptionalAs) {
+                    Error() << "Expecting mandatory AS here. "
+                            << "Did you miss comma? "
+                            << "Please add PRAGMA AnsiOptionalAs; "
+                            << "for ANSI compatibility";
+                    return std::unexpected(ESQLError::Basic);
+                }
+
                 return Id(block.GetAlt2().GetRule_an_id_as_compat1(), *this);
+            }
             case TRule_result_column_TAlt2_TBlock2::ALT_NOT_SET:
                 Y_UNREACHABLE();
         }
@@ -755,12 +822,21 @@ private:
         }
     }
 
-    TString TableAlias(const TRule_named_single_source::TBlock3::TBlock1& block) {
+    TMaybe<TString> TableAlias(const TRule_named_single_source::TBlock3::TBlock1& block) {
         switch (block.GetAltCase()) {
             case TRule_named_single_source_TBlock3_TBlock1::kAlt1:
                 return Id(block.GetAlt1().GetRule_an_id2(), *this);
-            case TRule_named_single_source_TBlock3_TBlock1::kAlt2:
+            case TRule_named_single_source_TBlock3_TBlock1::kAlt2: {
+                if (!Ctx_.AnsiOptionalAs) {
+                    Error() << "Expecting mandatory AS here. "
+                            << "Did you miss comma? "
+                            << "Please add PRAGMA AnsiOptionalAs; "
+                            << "for ANSI compatibility";
+                    return Nothing();
+                }
+
                 return Id(block.GetAlt2().GetRule_an_id_as_compat1(), *this);
+            }
             case TRule_named_single_source_TBlock3_TBlock1::ALT_NOT_SET:
                 Y_UNREACHABLE();
         }
@@ -792,10 +868,22 @@ std::unexpected<ESQLError> YqlSelectUnsupported(TContext& ctx, TStringBuf messag
     return std::unexpected(ESQLError::UnsupportedYqlSelect);
 }
 
-TNodeResult BuildYqlSelect(
+TNodeResult BuildYqlSelectStatement(
     TContext& ctx,
     NSQLTranslation::ESqlMode mode,
     const NSQLv1Generated::TRule_select_stmt& rule)
+{
+    return TYqlSelect(ctx, mode)
+        .Build(rule)
+        .transform([](auto x) {
+            return TNonNull(BuildYqlStatement(std::move(x)));
+        });
+}
+
+TNodeResult BuildYqlSelectStatement(
+    TContext& ctx,
+    NSQLTranslation::ESqlMode mode,
+    const NSQLv1Generated::TRule_values_stmt& rule)
 {
     return TYqlSelect(ctx, mode)
         .Build(rule)
@@ -817,24 +905,24 @@ TNodeResult BuildYqlSelectSubExpr(
         });
 }
 
+TNodeResult BuildYqlSelectSubExpr(
+    TContext& ctx,
+    NSQLTranslation::ESqlMode mode,
+    const NSQLv1Generated::TRule_select_unparenthesized_stmt& rule)
+{
+    return TYqlSelect(ctx, mode)
+        .Build(rule)
+        .transform([](auto x) {
+            return TNonNull(WrapYqlSelectSubExpr(std::move(x)));
+        });
+}
+
 TNodeResult BuildYqlExists(
     TContext& ctx,
     NSQLTranslation::ESqlMode mode,
     const NSQLv1Generated::TRule_exists_expr& rule)
 {
     return TYqlSelect(ctx, mode).Build(rule);
-}
-
-TNodeResult BuildYqlSelect(
-    TContext& ctx,
-    NSQLTranslation::ESqlMode mode,
-    const NSQLv1Generated::TRule_values_stmt& rule)
-{
-    return TYqlSelect(ctx, mode)
-        .Build(rule)
-        .transform([](auto x) {
-            return TNonNull(BuildYqlStatement(std::move(x)));
-        });
 }
 
 } // namespace NSQLTranslationV1

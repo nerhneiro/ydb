@@ -304,6 +304,10 @@ protected:
 
     TNodePtr ReturningList(const ::NSQLv1Generated::TRule_returning_columns_list& columns);
 
+    TNodePtr YqlSelectOrLegacy(
+        std::function<TNodeResult()> yqlSelect,
+        std::function<TNodePtr()> legacy);
+
 private:
     bool SimpleTableRefCoreImpl(const TRule_simple_table_ref_core& node, TTableRef& result);
     static bool IsValidFrameSettings(TContext& ctx, const TFrameSpecification& frameSpec, size_t sortSpecSize);
@@ -379,6 +383,6 @@ TVector<TPatternComponent<TChar>> SplitPattern(const TBasicString<TChar>& patter
 
 bool ParseNumbers(TContext& ctx, const TString& strOrig, ui64& value, TString& suffix);
 
-std::string::size_type GetQueryPosition(const TString& query, const NSQLv1Generated::TToken& token, bool antlr4);
+std::string::size_type GetQueryPosition(const TString& query, const NSQLv1Generated::TToken& token);
 
 } // namespace NSQLTranslationV1

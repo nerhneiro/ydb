@@ -1,4 +1,6 @@
 #include "sql_query.h"
+
+#include "select_yql.h"
 #include "sql_expression.h"
 #include "sql_select.h"
 #include "sql_select_yql.h"
@@ -186,6 +188,7 @@ static bool TransferSettingsEntry(std::map<TString, TNodePtr>& out,
             "flush_interval",
             "batch_size_bytes",
             "directory",
+            "metrics_level",
         };
         for (const auto& names : REPLICATION_AND_TRANSFER_SECRETS_SETTINGS) {
             settings.insert(names.Name);
@@ -204,6 +207,12 @@ static bool TransferSettingsEntry(std::map<TString, TNodePtr>& out,
         "consumer",
     };
 
+    static const TSet<TString> MetricsLevelValues = {
+        "database",
+        "object",
+        "detailed",
+    };
+
     const auto keyName = to_lower(key.Name);
     if (!ConfigSettings.count(keyName) && !StateSettings.contains(keyName) && !CreateOnlySettings.contains(keyName)) {
         ctx.Context().Error() << "Unknown transfer setting: " << key.Name;
@@ -220,6 +229,24 @@ static bool TransferSettingsEntry(std::map<TString, TNodePtr>& out,
         return false;
     }
 
+    if (keyName == "metrics_level") {
+        auto literalValue = value->GetLiteralValue();
+        if (!literalValue) {
+            ctx.Error() << " metrics_level value must be a string literal";
+            return false;
+        }
+
+        auto valueStr = to_lower(literalValue);
+        if (!MetricsLevelValues.contains(valueStr)) {
+            TStringBuilder validOptions;
+            for (const auto& val : MetricsLevelValues) {
+                validOptions << val << ", ";
+            }
+            ctx.Error() << "Invalid metrics_level value: " << valueStr
+                        << ". Allowed values: " << validOptions;
+            return false;
+        }
+    }
     if (!out.emplace(keyName, value).second) {
         ctx.Context().Error() << "Duplicate transfer setting: " << key.Name;
     }
@@ -287,40 +314,33 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            if (Ctx_.GetYqlSelectMode() != EYqlSelectMode::Disable) {
-                const NYql::TLangVersion langVer = YqlSelectLangVersion();
-                if (!IsBackwardCompatibleFeatureAvailable(langVer)) {
-                    Error() << "YqlSelect is not available before "
-                            << FormatLangVersion(langVer);
-                    return false;
-                }
+            const auto& stmt = core.GetAlt_sql_stmt_core2().GetRule_select_stmt1();
+            TNodePtr node = YqlSelectOrLegacy(
+                [&]() -> TNodeResult {
+                    return BuildYqlSelectStatement(Ctx_, Mode_, stmt);
+                },
+                [&]() -> TNodePtr {
+                    Ctx_.BodyPart();
 
-                const auto stmt = core.GetAlt_sql_stmt_core2().GetRule_select_stmt1();
-                if (auto result = BuildYqlSelect(Ctx_, Mode_, stmt)) {
-                    blocks.emplace_back(std::move(*result));
-                    break;
-                } else if (
-                    result.error() == ESQLError::UnsupportedYqlSelect &&
-                    Ctx_.GetYqlSelectMode() == EYqlSelectMode::Force)
-                {
-                    Error() << "Translation of the statement "
-                            << "to YqlSelect was forced, but unsupported";
-                    return false;
-                } else if (result.error() == ESQLError::Basic) {
-                    return false;
-                }
-            }
+                    TPosition pos;
+                    TSourcePtr source = TSqlSelect(Ctx_, Mode_).Build(stmt, pos);
+                    if (!source) {
+                        return nullptr;
+                    }
 
-            Ctx_.BodyPart();
-            TSqlSelect select(Ctx_, Mode_);
-            TPosition pos;
-            auto source = select.Build(core.GetAlt_sql_stmt_core2().GetRule_select_stmt1(), pos);
-            if (!source) {
+                    return BuildSelectResult(
+                        pos,
+                        std::move(source),
+                        Mode_ != NSQLTranslation::ESqlMode::LIMITED_VIEW && Mode_ != NSQLTranslation::ESqlMode::SUBQUERY,
+                        Mode_ == NSQLTranslation::ESqlMode::SUBQUERY,
+                        Ctx_.Scoped);
+                });
+
+            if (!node) {
                 return false;
             }
-            blocks.emplace_back(BuildSelectResult(pos, std::move(source),
-                                                  Mode_ != NSQLTranslation::ESqlMode::LIMITED_VIEW && Mode_ != NSQLTranslation::ESqlMode::SUBQUERY, Mode_ == NSQLTranslation::ESqlMode::SUBQUERY,
-                                                  Ctx_.Scoped));
+
+            blocks.emplace_back(std::move(node));
             break;
         }
         case TRule_sql_stmt_core::kAltSqlStmtCore3: {
@@ -330,6 +350,7 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (!nodeExpr) {
                 return false;
             }
+
             TVector<TNodePtr> nodes;
             auto subquery = nodeExpr->GetSource();
             if (subquery && Mode_ == NSQLTranslation::ESqlMode::LIBRARY && Ctx_.ScopeLevel == 0) {
@@ -359,6 +380,16 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 } else {
                     nodes.push_back(std::move(nodeExpr));
                 }
+            } else if (auto source = GetYqlSource(nodeExpr)) {
+                const auto alias = Ctx_.MakeName("yqlsubquerynode");
+                const auto ref = Ctx_.MakeName("yqlsubquery");
+
+                blocks.push_back(BuildYqlSubquery(source, alias));
+                blocks.back()->SetLabel(ref);
+
+                for (size_t i = 0; i < names.size(); ++i) {
+                    nodes.push_back(BuildYqlSubqueryRef(blocks.back(), ref));
+                }
             } else {
                 const auto ref = Ctx_.MakeName("namedexprnode");
                 blocks.push_back(BuildNamedExpr(names.size() > 1 ? BuildTupleResult(nodeExpr, names.size()) : nodeExpr));
@@ -381,8 +412,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (rule.HasBlock2()) { // OR REPLACE
                 replaceIfExists = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    (IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock2().GetToken1().GetId(), OR) &&
-                     IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock2().GetToken2().GetId(), REPLACE)));
+                    (IS_TOKEN(rule.GetBlock2().GetToken1().GetId(), OR) &&
+                     IS_TOKEN(rule.GetBlock2().GetToken2().GetId(), REPLACE)));
             }
 
             const bool isCreateTableAs = rule.HasBlock15();
@@ -390,7 +421,7 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             ETableType tableType = ETableType::Table;
             bool temporary = false;
             if (block.HasAlt2() &&
-                IS_TOKEN(Ctx_.Settings.Antlr4Parser, block.GetAlt2().GetToken1().GetId(), TABLESTORE)) {
+                IS_TOKEN(block.GetAlt2().GetToken1().GetId(), TABLESTORE)) {
                 tableType = ETableType::TableStore;
                 if (isCreateTableAs) {
                     Context().Error(GetPos(block.GetAlt2().GetToken1()))
@@ -398,15 +429,15 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                     return false;
                 }
             } else if (block.HasAlt3() &&
-                       IS_TOKEN(Ctx_.Settings.Antlr4Parser, block.GetAlt3().GetToken1().GetId(), EXTERNAL)) {
+                       IS_TOKEN(block.GetAlt3().GetToken1().GetId(), EXTERNAL)) {
                 tableType = ETableType::ExternalTable;
                 if (isCreateTableAs) {
                     Context().Error(GetPos(block.GetAlt3().GetToken1()))
                         << "CREATE TABLE AS is not supported for EXTERNAL TABLE";
                     return false;
                 }
-            } else if (block.HasAlt4() && IS_TOKEN(Ctx_.Settings.Antlr4Parser, block.GetAlt4().GetToken1().GetId(), TEMP) ||
-                       block.HasAlt5() && IS_TOKEN(Ctx_.Settings.Antlr4Parser, block.GetAlt5().GetToken1().GetId(), TEMPORARY)) {
+            } else if (block.HasAlt4() && IS_TOKEN(block.GetAlt4().GetToken1().GetId(), TEMP) ||
+                       block.HasAlt5() && IS_TOKEN(block.GetAlt5().GetToken1().GetId(), TEMPORARY)) {
                 temporary = true;
             }
 
@@ -414,9 +445,9 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (rule.HasBlock4()) { // IF NOT EXISTS
                 existingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock4().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock4().GetToken2().GetId(), NOT) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock4().GetToken3().GetId(), EXISTS));
+                    IS_TOKEN(rule.GetBlock4().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(rule.GetBlock4().GetToken2().GetId(), NOT) &&
+                    IS_TOKEN(rule.GetBlock4().GetToken3().GetId(), EXISTS));
             }
 
             if (replaceIfExists && tableType != ETableType::ExternalTable) {
@@ -427,6 +458,11 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
 
             TTableRef tr;
             if (!SimpleTableRefImpl(rule.GetRule_simple_table_ref5(), tr)) {
+                return false;
+            }
+
+            if (existingOk && tr.Service == YtProviderName) {
+                Error() << "CREATE TABLE IF NOT EXISTS is not supported for " << tr.Service << " provider.";
                 return false;
             }
 
@@ -502,8 +538,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (rule.HasBlock3()) { // IF EXISTS
                 missingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock3().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetBlock3().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(rule.GetBlock3().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(rule.GetBlock3().GetToken2().GetId(), EXISTS));
             }
 
             TTableRef tr;
@@ -593,9 +629,14 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
         case TRule_sql_stmt_core::kAltSqlStmtCore15: {
             Ctx_.BodyPart();
             const auto& rule = core.GetAlt_sql_stmt_core15().GetRule_alter_table_stmt1();
-            const bool isTablestore = IS_TOKEN(Ctx_.Settings.Antlr4Parser, rule.GetToken2().GetId(), TABLESTORE);
+            const bool isTablestore = IS_TOKEN(rule.GetToken2().GetId(), TABLESTORE);
             TTableRef tr;
             if (!SimpleTableRefImpl(rule.GetRule_simple_table_ref3(), tr)) {
+                return false;
+            }
+
+            if (tr.Service == YtProviderName) {
+                Error() << "ALTER TABLE is not supported for " << tr.Service << " provider.";
                 return false;
             }
 
@@ -697,38 +738,34 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            if (Ctx_.GetYqlSelectMode() != EYqlSelectMode::Disable) {
-                const NYql::TLangVersion langVer = YqlSelectLangVersion();
-                if (!IsBackwardCompatibleFeatureAvailable(langVer)) {
-                    Error() << "YqlSelect is not available before "
-                            << FormatLangVersion(langVer);
-                    return false;
-                }
+            const auto& stmt = core.GetAlt_sql_stmt_core21().GetRule_values_stmt1();
+            TNodePtr node = YqlSelectOrLegacy(
+                [&]() -> TNodeResult {
+                    return BuildYqlSelectStatement(Ctx_, Mode_, stmt);
+                },
+                [&]() -> TNodePtr {
+                    Ctx_.BodyPart();
 
-                const auto stmt = core.GetAlt_sql_stmt_core21().GetRule_values_stmt1();
-                if (auto result = BuildYqlSelect(Ctx_, Mode_, stmt)) {
-                    blocks.emplace_back(std::move(*result));
-                    break;
-                } else if (
-                    result.error() == ESQLError::UnsupportedYqlSelect &&
-                    Ctx_.GetYqlSelectMode() == EYqlSelectMode::Force)
-                {
-                    Error() << "Translation of the statement "
-                            << "to YqlSelect was forced, but unsupported";
-                    return false;
-                }
-            }
+                    TPosition pos;
+                    TSourcePtr source = TSqlValues(Ctx_, Mode_).Build(stmt, pos, {}, TPosition());
 
-            Ctx_.BodyPart();
-            TSqlValues values(Ctx_, Mode_);
-            TPosition pos;
-            auto source = values.Build(core.GetAlt_sql_stmt_core21().GetRule_values_stmt1(), pos, {}, TPosition());
-            if (!source) {
+                    if (!source) {
+                        return nullptr;
+                    }
+
+                    return BuildSelectResult(
+                        pos,
+                        std::move(source),
+                        Mode_ != NSQLTranslation::ESqlMode::LIMITED_VIEW && Mode_ != NSQLTranslation::ESqlMode::SUBQUERY,
+                        Mode_ == NSQLTranslation::ESqlMode::SUBQUERY,
+                        Ctx_.Scoped);
+                });
+
+            if (!node) {
                 return false;
             }
-            blocks.emplace_back(BuildSelectResult(pos, std::move(source),
-                                                  Mode_ != NSQLTranslation::ESqlMode::LIMITED_VIEW && Mode_ != NSQLTranslation::ESqlMode::SUBQUERY, Mode_ == NSQLTranslation::ESqlMode::SUBQUERY,
-                                                  Ctx_.Scoped));
+
+            blocks.emplace_back(std::move(node));
             break;
         }
         case TRule_sql_stmt_core::kAltSqlStmtCore22: {
@@ -897,7 +934,7 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             switch (node.GetBlock4().Alt_case()) {
                 case TRule_alter_group_stmt_TBlock4::kAlt1: {
                     auto& addDropNode = node.GetBlock4().GetAlt1();
-                    const bool isDrop = IS_TOKEN(Ctx_.Settings.Antlr4Parser, addDropNode.GetToken1().GetId(), DROP);
+                    const bool isDrop = IS_TOKEN(addDropNode.GetToken1().GetId(), DROP);
                     TVector<TDeferredAtom> roles;
                     bool allowSystemRoles = false;
                     roles.emplace_back();
@@ -946,13 +983,13 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
-            const bool isUser = IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetToken2().GetId(), USER);
+            const bool isUser = IS_TOKEN(node.GetToken2().GetId(), USER);
             bool missingOk = false;
             if (node.HasBlock3()) { // IF EXISTS
                 missingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock3().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock3().GetToken2().GetId(), EXISTS));
             }
 
             TVector<TDeferredAtom> roles;
@@ -987,9 +1024,9 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (node.HasBlock3()) { // IF NOT EXISTS
                 existingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken2().GetId(), NOT) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken3().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock3().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock3().GetToken2().GetId(), NOT) &&
+                    IS_TOKEN(node.GetBlock3().GetToken3().GetId(), EXISTS));
             }
 
             const TString& objectId = Id(node.GetRule_object_ref4().GetRule_id_or_at2(), *this).second;
@@ -1040,8 +1077,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (node.HasBlock3()) { // IF EXISTS
                 missingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock3().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock3().GetToken2().GetId(), EXISTS));
             }
 
             const TString& objectId = Id(node.GetRule_object_ref4().GetRule_id_or_at2(), *this).second;
@@ -1071,17 +1108,17 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (node.HasBlock2()) { // OR REPLACE
                 replaceIfExists = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock2().GetToken1().GetId(), OR) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock2().GetToken2().GetId(), REPLACE));
+                    IS_TOKEN(node.GetBlock2().GetToken1().GetId(), OR) &&
+                    IS_TOKEN(node.GetBlock2().GetToken2().GetId(), REPLACE));
             }
 
             bool existingOk = false;
             if (node.HasBlock6()) { // IF NOT EXISTS
                 existingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock6().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock6().GetToken2().GetId(), NOT) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock6().GetToken3().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock6().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock6().GetToken2().GetId(), NOT) &&
+                    IS_TOKEN(node.GetBlock6().GetToken3().GetId(), EXISTS));
             }
 
             const TString& objectId = Id(node.GetRule_object_ref7().GetRule_id_or_at2(), *this).second;
@@ -1144,8 +1181,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (node.HasBlock5()) { // IF EXISTS
                 missingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock5().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock5().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock5().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock5().GetToken2().GetId(), EXISTS));
             }
 
             const TString& objectId = Id(node.GetRule_object_ref6().GetRule_id_or_at2(), *this).second;
@@ -1437,6 +1474,14 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                 return false;
             }
 
+            if (context.ServiceId == YtProviderName) {
+                auto requiredLangVer = MakeLangVersion(2025, 5);
+                if (!IsBackwardCompatibleFeatureAvailable(requiredLangVer)) {
+                    Error() << "CREATE VIEW is not available before language version " << FormatLangVersion(requiredLangVer);
+                    return false;
+                }
+            }
+
             const bool existingOk = node.HasBlock3();
 
             std::map<TString, TDeferredAtom> features;
@@ -1497,6 +1542,14 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                                  false,
                                  context.ServiceId,
                                  context.Cluster)) {
+                    return false;
+                }
+            }
+
+            if (context.ServiceId == YtProviderName) {
+                auto requiredLangVer = MakeLangVersion(2025, 5);
+                if (!IsBackwardCompatibleFeatureAvailable(requiredLangVer)) {
+                    Error() << "DROP VIEW is not available before language version " << FormatLangVersion(requiredLangVer);
                     return false;
                 }
             }
@@ -1928,8 +1981,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (node.HasBlock3()) { // IF EXISTS
                 params.MissingOk = true;
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock3().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock3().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock3().GetToken2().GetId(), EXISTS));
             }
 
             for (const auto& block : node.GetBlock5()) {
@@ -2122,17 +2175,17 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             const bool replaceIfExists = node.HasBlock2();
             if (replaceIfExists) {
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock2().GetToken1().GetId(), OR) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock2().GetToken2().GetId(), REPLACE));
+                    IS_TOKEN(node.GetBlock2().GetToken1().GetId(), OR) &&
+                    IS_TOKEN(node.GetBlock2().GetToken2().GetId(), REPLACE));
             }
 
             // IF NOT EXISTS
             const bool existingOk = node.HasBlock5();
             if (existingOk) {
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock5().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock5().GetToken2().GetId(), NOT) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock5().GetToken3().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock5().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock5().GetToken2().GetId(), NOT) &&
+                    IS_TOKEN(node.GetBlock5().GetToken3().GetId(), EXISTS));
             }
 
             // WITH streaming_query_settings
@@ -2171,8 +2224,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             const bool missingOk = node.HasBlock4();
             if (missingOk) {
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock4().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock4().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock4().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock4().GetToken2().GetId(), EXISTS));
             }
 
             // alter_streaming_query_action
@@ -2200,8 +2253,8 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             const bool missingOk = node.HasBlock4();
             if (missingOk) {
                 Y_DEBUG_ABORT_UNLESS(
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock4().GetToken1().GetId(), IF) &&
-                    IS_TOKEN(Ctx_.Settings.Antlr4Parser, node.GetBlock4().GetToken2().GetId(), EXISTS));
+                    IS_TOKEN(node.GetBlock4().GetToken1().GetId(), IF) &&
+                    IS_TOKEN(node.GetBlock4().GetToken2().GetId(), EXISTS));
             }
 
             AddStatementToBlocks(blocks, BuildDropObjectOperation(Ctx_.Pos(), *objectPath, "STREAMING_QUERY", missingOk, {}, context));

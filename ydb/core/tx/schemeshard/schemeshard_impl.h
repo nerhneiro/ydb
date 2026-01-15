@@ -91,6 +91,10 @@ class TShredManager;
 // Forward declaration for incremental restore context
 struct TIncrementalRestoreState;
 
+// Forward declaration for index build info
+struct TIndexBuildInfo;
+struct TIndexBuildShardStatus;
+
 class TSchemeShard
     : public TActor<TSchemeShard>
     , public NTabletFlatExecutor::TTabletExecutedFlat
@@ -247,6 +251,7 @@ public:
 
     THashMap<TPathId, TTableInfo::TPtr> Tables;
     THashMap<TPathId, TTableInfo::TPtr> TTLEnabledTables;
+    ui32 MaxTTLShardsInFlight = 0;
 
     THashMap<TPathId, TTableIndexInfo::TPtr> Indexes;
     THashMap<TPathId, TCdcStreamInfo::TPtr> CdcStreams;
@@ -351,7 +356,6 @@ public:
     bool EnableBorrowedSplitCompaction = false;
     bool EnableMoveIndex = true;
     bool EnableAlterDatabaseCreateHiveFirst = false;
-    bool EnablePQConfigTransactionsAtSchemeShard = false;
     bool EnableStatistics = false;
     bool EnableServerlessExclusiveDynamicNodes = false;
     bool EnableAddColumsWithDefaults = false;
@@ -425,7 +429,7 @@ public:
     THolder<TEvDataShard::TEvProposeTransaction> MakeDataShardProposal(const TPathId& pathId, const TOperationId& opId,
         const TString& body, const TActorContext& ctx) const;
     THolder<TEvColumnShard::TEvProposeTransaction> MakeColumnShardProposal(const TPathId& pathId, const TOperationId& opId,
-        const TMessageSeqNo& seqNo, const TString& body, const TActorContext& ctx) const;
+        const TMessageSeqNo& seqNo, const TString& body, const TActorContext& ctx, NKikimrTxColumnShard::ETransactionKind kind = NKikimrTxColumnShard::TX_KIND_SCHEMA) const;
 
     THolder<::NActors::IEventBase> MakeShardProposal(const TPath& path, const TOperationId& opId,
         const TMessageSeqNo& seqNo, const TString& body, const TActorContext& ctx) const;
@@ -1348,8 +1352,9 @@ public:
     // } // NLongRunningCommon
 
     // namespace NExport {
-    TMap<ui64, TExportInfo::TPtr> Exports;
+    THashMap<ui64, TExportInfo::TPtr> Exports;
     THashMap<TString, TExportInfo::TPtr> ExportsByUid;
+    TSet<std::pair<TInstant, ui64>> ExportsByTime;
     THashMap<TTxId, std::pair<ui64, ui32>> TxIdToExport;
     THashMap<TTxId, THashSet<ui64>> TxIdToDependentExport;
     // This set is needed to kill all the running scheme uploaders on SchemeShard death.
@@ -1359,9 +1364,10 @@ public:
     THashMap<TTxId, ui64> TxIdToIncrementalRestore;
 
     void FromXxportInfo(NKikimrExport::TExport& exprt, const TExportInfo& exportInfo);
+    void AddExport(const TExportInfo::TPtr& exportInfo);
 
     static void PersistCreateExport(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
-    static void PersistRemoveExport(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
+    void PersistRemoveExport(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
     static void PersistExportPathId(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
     static void PersistExportState(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
     static void PersistExportMetadata(NIceDb::TNiceDb& db, const TExportInfo& exportInfo);
@@ -1405,18 +1411,20 @@ public:
     // } // NExport
 
     // namespace NImport {
-    TMap<ui64, TImportInfo::TPtr> Imports;
+    THashMap<ui64, TImportInfo::TPtr> Imports;
     THashMap<TString, TImportInfo::TPtr> ImportsByUid;
+    TSet<std::pair<TInstant, ui64>> ImportsByTime;
     THashMap<TTxId, std::pair<ui64, ui32>> TxIdToImport;
     THashSet<TActorId> RunningImportSchemeGetters;
     THashSet<TActorId> RunningImportSchemeQueryExecutors;
 
     void FromXxportInfo(NKikimrImport::TImport& exprt, const TImportInfo& importInfo);
+    void AddImport(const TImportInfo::TPtr& importInfo);
 
     static void PersistCreateImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistNewImportItem(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistSchemaMappingImportFields(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
-    static void PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
+    void PersistRemoveImport(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportState(NIceDb::TNiceDb& db, const TImportInfo& importInfo);
     static void PersistImportItemState(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
     static void PersistImportItemScheme(NIceDb::TNiceDb& db, const TImportInfo& importInfo, ui32 itemIdx);
@@ -1523,13 +1531,16 @@ public:
     // namespace NIndexBuilder {
     TControlWrapper AllowDataColumnForIndexTable;
 
-    TMap<TIndexBuildId, TIndexBuildInfo::TPtr> IndexBuilds;
-    THashMap<TString, TIndexBuildInfo::TPtr> IndexBuildsByUid;
+    THashMap<TIndexBuildId, std::shared_ptr<TIndexBuildInfo>> IndexBuilds;
+    THashMap<TString, std::shared_ptr<TIndexBuildInfo>> IndexBuildsByUid;
+    TSet<std::pair<TInstant, TIndexBuildId>> IndexBuildsByTime;
     THashMap<TTxId, TIndexBuildId> TxIdToIndexBuilds;
 
     // do not share pipes with operations
     // also do not share pipes between IndexBuilds
     TDedicatedPipePool<TIndexBuildId> IndexBuildPipes;
+
+    void AddIndexBuild(const std::shared_ptr<TIndexBuildInfo>& indexInfo);
 
     void PersistCreateBuildIndex(NIceDb::TNiceDb& db, const TIndexBuildInfo& indexInfo);
     void PersistBuildIndexState(NIceDb::TNiceDb& db, const TIndexBuildInfo& indexInfo);
@@ -1556,11 +1567,11 @@ public:
     void PersistBuildIndexUnlockTxStatus(NIceDb::TNiceDb& db, const TIndexBuildInfo& indexInfo);
     void PersistBuildIndexUnlockTxDone(NIceDb::TNiceDb& db, const TIndexBuildInfo& indexInfo);
 
-    void PersistBuildIndexShardStatusInitiate(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus);
-    void PersistBuildIndexShardStatus(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus);
-    void PersistBuildIndexShardRange(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus);
-    void PersistBuildIndexShardStatusFulltext(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildInfo::TShardStatus& shardStatus);
-    void PersistBuildIndexShardStatusReset(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, TIndexBuildInfo::TShardStatus& shardStatus);
+    void PersistBuildIndexShardStatusInitiate(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildShardStatus& shardStatus);
+    void PersistBuildIndexShardStatus(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildShardStatus& shardStatus);
+    void PersistBuildIndexShardRange(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildShardStatus& shardStatus);
+    void PersistBuildIndexShardStatusFulltext(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, const TIndexBuildShardStatus& shardStatus);
+    void PersistBuildIndexShardStatusReset(NIceDb::TNiceDb& db, TIndexBuildId buildId, const TShardIdx& shardIdx, TIndexBuildShardStatus& shardStatus);
     void PersistBuildIndexShardStatusReset(NIceDb::TNiceDb& db, TIndexBuildInfo& info);
 
     void PersistBuildIndexDropColumnsTxId(NIceDb::TNiceDb& db, const TIndexBuildInfo& indexInfo);
